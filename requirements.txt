@@ -1,0 +1,28 @@
+# Retrieva AI - Core Backend Dependencies
+# Phase 1 & 2: API, Foundation & Document Ingestion
+
+# Web Framework & Server
+fastapi>=0.110.0,<1.0.0
+uvicorn[standard]>=0.28.0,<1.0.0
+python-multipart>=0.0.9
+
+# Settings & Data Validation
+pydantic>=2.6.0,<3.0.0
+pydantic-settings>=2.2.0,<3.0.0
+python-dotenv>=1.0.1,<2.0.0
+
+# Document Ingestion & Extraction (Phase 2)
+pymupdf>=1.24.0
+
+# Testing & Client
+pytest>=8.0.0,<9.0.0
+pytest-asyncio>=0.23.0,<1.0.0
+httpx>=0.27.0,<1.0.0
+
+# Dense Embeddings & Vector Storage (Phase 3)
+sentence-transformers>=2.6.0
+chromadb>=0.4.24
+
+# LLM Answer Generation & Evaluation (Phase 5)
+openai>=1.14.0
+tiktoken>=0.7.0
