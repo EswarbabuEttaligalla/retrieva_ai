@@ -1,0 +1,17 @@
+"""Health check schema models."""
+
+from datetime import datetime, timezone
+from pydantic import BaseModel, Field
+
+
+class HealthResponse(BaseModel):
+    """Health check status response contract."""
+
+    status: str = Field(default="healthy", description="Current service health status")
+    app_name: str = Field(..., description="Application name")
+    version: str = Field(..., description="Application version")
+    environment: str = Field(..., description="Running environment (development, production, etc.)")
+    timestamp: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        description="UTC timestamp of the health check inspection",
+    )
