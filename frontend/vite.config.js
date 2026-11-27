@@ -9,7 +9,7 @@ export default defineConfig({
     host: true,
   },
   preview: {
-    host: '0.0.0.0',
-    allowedHosts: ['retrieva-frontend-production.up.railway.app'],
-  },
+  host: '0.0.0.0',
+  allowedHosts: ['retrieva.up.railway.app'],
+},
 })
