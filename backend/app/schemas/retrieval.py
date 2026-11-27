@@ -109,6 +109,10 @@ class RetrievalConfiguration(BaseModel):
         default=None,
         description="Optional filter restricting retrieval to a specific document ID",
     )
+    document_ids_filter: Optional[List[str]] = Field(
+        default=None,
+        description="Optional filter restricting retrieval to a list of document IDs",
+    )
 
     @field_validator("candidate_k")
     @classmethod
@@ -147,10 +151,13 @@ class RetrievalRequest(BaseModel):
                     "bm25_k1",
                     "bm25_b",
                     "document_id_filter",
+                    "document_ids_filter",
                 }
                 extracted_config = {k: v for k, v in data.items() if k in config_fields}
+                if "document_ids" in data and "document_ids_filter" not in extracted_config:
+                    extracted_config["document_ids_filter"] = data.get("document_ids")
                 if extracted_config:
-                    data = {k: v for k, v in data.items() if k not in config_fields}
+                    data = {k: v for k, v in data.items() if k not in config_fields and k != "document_ids"}
                     data["config"] = extracted_config
         return data
 

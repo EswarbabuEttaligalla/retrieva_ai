@@ -100,7 +100,6 @@ def streaming_rag_fixture(shared_embedder):
         collection_name="test_streaming_collection",
         persist_directory=temp_dir,
     )
-    bm25 = BM25Index()
 
     doc1_chunk = DocumentChunk(
         chunk_id="chunk_thermo_01",
@@ -132,24 +131,12 @@ def streaming_rag_fixture(shared_embedder):
 
     chunks = [doc1_chunk, doc2_chunk]
     embeddings = shared_embedder.embed_batch([c.chunk_text for c in chunks])
-    store.add_chunks(chunks, embeddings, prevent_duplicates=False)
-    for c in chunks:
-        bm25.add_chunk({
-            "chunk_id": c.chunk_id,
-            "document_id": c.document_id,
-            "filename": c.filename,
-            "chunk_text": c.chunk_text,
-            "page_number": c.page_number,
-            "page_references": c.page_references,
-            "start_offset": c.start_offset,
-            "end_offset": c.end_offset,
-        })
+    from uuid import UUID
+    store.add_chunks(chunks, embeddings, owner_id=UUID("11111111-1111-4111-8111-111111111111"), prevent_duplicates=False)
 
     retriever = Retriever(
         dense_retriever=DenseRetriever(embedder=shared_embedder, vector_store=store),
-        bm25_index=bm25,
         vector_store=store,
-        auto_sync_bm25=False,
     )
 
     mock_llm = MagicMock(spec=OpenAIClient)
@@ -180,13 +167,23 @@ def streaming_rag_fixture(shared_embedder):
         context_builder=ContextBuilder(),
     )
 
+    prev_retriever = app.dependency_overrides.get(get_retriever)
+    prev_rag = app.dependency_overrides.get(get_rag_service)
     app.dependency_overrides[get_retriever] = lambda: retriever
     app.dependency_overrides[get_rag_service] = lambda: rag_service
 
-    yield rag_service, mock_llm
-
-    app.dependency_overrides.clear()
-    shutil.rmtree(temp_dir, ignore_errors=True)
+    try:
+        yield rag_service, mock_llm
+    finally:
+        if prev_retriever is None:
+            app.dependency_overrides.pop(get_retriever, None)
+        else:
+            app.dependency_overrides[get_retriever] = prev_retriever
+        if prev_rag is None:
+            app.dependency_overrides.pop(get_rag_service, None)
+        else:
+            app.dependency_overrides[get_rag_service] = prev_rag
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)
@@ -450,7 +447,7 @@ class TestStreamingAPIEndpoints:
         import asyncio
 
         async def run_and_close():
-            gen = rag_service.answer_question_stream(AnswerRequest(query="test"))
+            gen = rag_service.answer_question_stream(AnswerRequest(query="test"), owner_id="11111111-1111-4111-8111-111111111111")
             async for ev in gen:
                 if "event: token" in ev:
                     break
@@ -467,7 +464,7 @@ class TestStreamingAPIEndpoints:
         import asyncio
 
         async def simulate_cancellation():
-            gen = rag_service.answer_question_stream(AnswerRequest(query="test query"))
+            gen = rag_service.answer_question_stream(AnswerRequest(query="test query"), owner_id="11111111-1111-4111-8111-111111111111")
             # Read 2 events then simulate client abort
             await gen.__anext__()
             await gen.__anext__()
@@ -574,7 +571,7 @@ class TestStreamingAPIEndpoints:
 
         tokens_received = []
         try:
-            gen = rag_service.answer_question_stream(AnswerRequest(query="second law"))
+            gen = rag_service.answer_question_stream(AnswerRequest(query="second law"), owner_id="11111111-1111-4111-8111-111111111111")
             async for ev in gen:
                 if "event: token" in ev:
                     tokens_received.append(ev)
@@ -604,7 +601,7 @@ class TestStreamingAPIEndpoints:
 
         async def consume_stream(q):
             events = []
-            async for ev in rag_service.answer_question_stream(AnswerRequest(query=q)):
+            async for ev in rag_service.answer_question_stream(AnswerRequest(query=q), owner_id="11111111-1111-4111-8111-111111111111"):
                 events.append(ev)
             return events
 
@@ -637,7 +634,7 @@ class TestStreamingAPIEndpoints:
 
         mock_llm.generate_stream_async = MagicMock(side_effect=cancellable_stream)
 
-        gen = rag_service.answer_question_stream(AnswerRequest(query="test"))
+        gen = rag_service.answer_question_stream(AnswerRequest(query="test"), owner_id="11111111-1111-4111-8111-111111111111")
         async for ev in gen:
             if "event: token" in ev:
                 break
@@ -703,7 +700,7 @@ class TestStreamingAPIEndpoints:
             delattr(mock_llm, "generate_stream_async")
 
         try:
-            gen = rag_service.answer_question_stream(AnswerRequest(query="entropy"))
+            gen = rag_service.answer_question_stream(AnswerRequest(query="entropy"), owner_id="11111111-1111-4111-8111-111111111111")
             # Read first event (status)
             ev = await gen.__anext__()
             assert "event: status" in ev
@@ -734,7 +731,7 @@ class TestStreamingAPIEndpoints:
             delattr(mock_llm, "generate_stream_async")
 
         try:
-            gen = rag_service.answer_question_stream(AnswerRequest(query="entropy"))
+            gen = rag_service.answer_question_stream(AnswerRequest(query="entropy"), owner_id="11111111-1111-4111-8111-111111111111")
             events = []
             async for ev in gen:
                 events.append(ev)
@@ -765,7 +762,7 @@ class TestStreamingAPIEndpoints:
             delattr(mock_llm, "generate_stream_async")
 
         try:
-            gen = rag_service.answer_question_stream(AnswerRequest(query="entropy"))
+            gen = rag_service.answer_question_stream(AnswerRequest(query="entropy"), owner_id="11111111-1111-4111-8111-111111111111")
             # Advance past status to trigger worker thread read
             ev1 = await gen.__anext__()
             assert "event: status" in ev1
@@ -808,7 +805,7 @@ class TestStreamingAPIEndpoints:
 
         hb_task = asyncio.create_task(heartbeat())
         try:
-            gen = rag_service.answer_question_stream(AnswerRequest(query="entropy"))
+            gen = rag_service.answer_question_stream(AnswerRequest(query="entropy"), owner_id="11111111-1111-4111-8111-111111111111")
             async for _ in gen:
                 pass
         finally:

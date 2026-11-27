@@ -13,6 +13,7 @@ import math
 import shutil
 import tempfile
 from typing import Any, Dict, List
+from uuid import UUID
 
 import pytest
 
@@ -23,12 +24,15 @@ from backend.app.retrieval.dense import DenseRetriever
 from backend.app.retrieval.evaluation import (
     EVALUATION_DOCUMENTS,
     EVALUATION_QUERIES,
+    EVAL_OWNER_ID,
     calculate_hit_rate_at_k,
     calculate_precision_at_k,
     calculate_recall_at_k,
     calculate_reciprocal_rank,
     run_retrieval_benchmark,
 )
+
+TEST_OWNER_ID = UUID("11111111-1111-4111-8111-111111111111")
 from backend.app.retrieval.fusion import reciprocal_rank_fusion
 from backend.app.retrieval.reranker import CrossEncoderReranker
 from backend.app.retrieval.retriever import Retriever
@@ -94,7 +98,7 @@ def populate_store_with_sample_chunks(store: ChromaVectorStore, embedder: Senten
         texts.append(txt)
 
     embeddings = embedder.embed_batch(texts)
-    store.add_chunks(chunks, embeddings, prevent_duplicates=False)
+    store.add_chunks(chunks, embeddings, owner_id=TEST_OWNER_ID, prevent_duplicates=False)
     return chunks
 
 
@@ -140,7 +144,7 @@ class TestDenseRetrieval:
         populate_store_with_sample_chunks(store, shared_embedder)
 
         dense = DenseRetriever(embedder=shared_embedder, vector_store=store)
-        results = dense.search(query="How does RAG help language models?", top_k=2)
+        results = dense.search(query="How does RAG help language models?", owner_id=TEST_OWNER_ID, top_k=2)
 
         assert len(results) == 2
         # The top result should be the RAG chunk (c3)
@@ -158,16 +162,16 @@ class TestDenseRetrieval:
         populate_store_with_sample_chunks(store, shared_embedder)
 
         dense = DenseRetriever(embedder=shared_embedder, vector_store=store)
-        res_k1 = dense.search(query="Python programming", top_k=1)
+        res_k1 = dense.search(query="Python programming", owner_id=TEST_OWNER_ID, top_k=1)
         assert len(res_k1) == 1
 
-        res_k3 = dense.search(query="Python programming", top_k=3)
+        res_k3 = dense.search(query="Python programming", owner_id=TEST_OWNER_ID, top_k=3)
         assert len(res_k3) == 3
 
     def test_dense_retrieval_empty_collection(self, isolated_vector_store, shared_embedder):
         store, _ = isolated_vector_store
         dense = DenseRetriever(embedder=shared_embedder, vector_store=store)
-        results = dense.search(query="Anything", top_k=5)
+        results = dense.search(query="Anything", owner_id=TEST_OWNER_ID, top_k=5)
         assert results == []
 
     def test_dense_retrieval_document_id_filter(self, isolated_vector_store, shared_embedder):
@@ -176,7 +180,7 @@ class TestDenseRetrieval:
 
         dense = DenseRetriever(embedder=shared_embedder, vector_store=store)
         # Filter strictly for doc_chroma
-        results = dense.search(query="programming language", top_k=5, document_id_filter="doc_chroma")
+        results = dense.search(query="programming language", owner_id=TEST_OWNER_ID, top_k=5, document_id_filter="doc_chroma")
         assert len(results) == 1
         assert results[0].document_id == "doc_chroma"
         assert results[0].chunk_id == "c5"
@@ -189,6 +193,7 @@ class TestDenseRetrieval:
         # High threshold should filter out less relevant chunks
         high_thresh_results = dense.search(
             query="Python programming language",
+            owner_id=TEST_OWNER_ID,
             top_k=5,
             similarity_threshold=0.85,  # Very strict
         )
@@ -397,9 +402,7 @@ class TestRetrievalOrchestrator:
 
         retriever = Retriever(
             dense_retriever=DenseRetriever(embedder=shared_embedder, vector_store=store),
-            bm25_index=BM25Index(),
             vector_store=store,
-            auto_sync_bm25=True,
         )
         return retriever
 
@@ -408,7 +411,7 @@ class TestRetrievalOrchestrator:
             query="vector database storage",
             config=RetrievalConfiguration(mode=RetrievalMode.DENSE, top_k=2),
         )
-        res = test_retriever.retrieve(req)
+        res = test_retriever.retrieve(req, owner_id=TEST_OWNER_ID)
 
         assert res.mode == RetrievalMode.DENSE
         assert len(res.chunks) == 2
@@ -420,7 +423,7 @@ class TestRetrievalOrchestrator:
             query="dynamic typing reference counting",
             config=RetrievalConfiguration(mode=RetrievalMode.BM25, top_k=2),
         )
-        res = test_retriever.retrieve(req)
+        res = test_retriever.retrieve(req, owner_id=TEST_OWNER_ID)
 
         assert res.mode == RetrievalMode.BM25
         assert len(res.chunks) >= 1
@@ -436,7 +439,7 @@ class TestRetrievalOrchestrator:
                 candidate_k=5,
             ),
         )
-        res = test_retriever.retrieve(req)
+        res = test_retriever.retrieve(req, owner_id=TEST_OWNER_ID)
 
         assert res.mode == RetrievalMode.HYBRID
         assert len(res.chunks) <= 3
@@ -453,7 +456,7 @@ class TestRetrievalOrchestrator:
                 enable_reranking=True,
             ),
         )
-        res = test_retriever.retrieve(req)
+        res = test_retriever.retrieve(req, owner_id=TEST_OWNER_ID)
 
         assert res.mode == RetrievalMode.HYBRID
         assert len(res.chunks) == 2
@@ -494,13 +497,11 @@ class TestRetrievalBenchmark:
             texts.append(txt)
 
         embeddings = shared_embedder.embed_batch(texts)
-        store.add_chunks(chunks, embeddings, prevent_duplicates=False)
+        store.add_chunks(chunks, embeddings, owner_id=EVAL_OWNER_ID, prevent_duplicates=False)
 
         retriever = Retriever(
             dense_retriever=DenseRetriever(embedder=shared_embedder, vector_store=store),
-            bm25_index=BM25Index(),
             vector_store=store,
-            auto_sync_bm25=True,
         )
 
         results = run_retrieval_benchmark(retriever, queries=EVALUATION_QUERIES, eval_ks=[3, 5])

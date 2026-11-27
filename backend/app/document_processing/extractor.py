@@ -77,6 +77,81 @@ class DocumentExtractor:
         else:
             raise UnsupportedFileTypeError(f"Unsupported file format: {ext}")
 
+    @staticmethod
+    def _format_markdown_table(rows: List[List[Any]]) -> str:
+        """Format extracted table rows as a clean row-preserving Markdown table."""
+        cleaned_rows: List[List[str]] = []
+        max_cols = 0
+        for row in rows:
+            if not row:
+                continue
+            cells = [" ".join(str(cell or "").split()) for cell in row]
+            if any(cells):
+                cleaned_rows.append(cells)
+                max_cols = max(max_cols, len(cells))
+
+        if not cleaned_rows or max_cols == 0:
+            return ""
+
+        padded = [r + [""] * (max_cols - len(r)) for r in cleaned_rows]
+        lines = ["| " + " | ".join(padded[0]) + " |"]
+        if len(padded) > 1:
+            lines.append("| " + " | ".join("---" for _ in range(max_cols)) + " |")
+            for data_row in padded[1:]:
+                lines.append("| " + " | ".join(data_row) + " |")
+        return "\n".join(lines)
+
+    @classmethod
+    def _extract_pdf_page_text(cls, page: Any) -> str:
+        """Extract PDF page text while preserving table rows and column headers."""
+        try:
+            table_finder = page.find_tables() if hasattr(page, "find_tables") else None
+            tables = list(getattr(table_finder, "tables", None) or [])
+        except Exception:
+            tables = []
+
+        if not tables:
+            return page.get_text("text") or ""
+
+        try:
+            blocks = page.get_text("blocks") or []
+        except Exception:
+            return page.get_text("text") or ""
+
+        table_rects = []
+        positioned_elements: List[Tuple[float, float, str]] = []
+        for tbl in tables:
+            bbox = getattr(tbl, "bbox", None)
+            if bbox is None:
+                continue
+            rect = fitz.Rect(bbox)
+            md_table = cls._format_markdown_table(tbl.extract() or [])
+            if md_table:
+                table_rects.append(rect)
+                positioned_elements.append((rect.y0, rect.x0, md_table))
+
+        if not positioned_elements:
+            return page.get_text("text") or ""
+
+        for blk in blocks:
+            if len(blk) < 7 or blk[6] != 0:
+                continue
+            blk_rect = fitz.Rect(blk[:4])
+            blk_text = (blk[4] or "").strip()
+            if not blk_text:
+                continue
+            blk_area = max(blk_rect.get_area(), 1e-6)
+            overlaps_table = any(
+                (blk_rect & t_rect).get_area() / blk_area > 0.5
+                for t_rect in table_rects
+            )
+            if not overlaps_table:
+                positioned_elements.append((blk_rect.y0, blk_rect.x0, blk_text))
+
+        positioned_elements.sort(key=lambda item: (item[0], item[1]))
+        combined = "\n\n".join(item[2] for item in positioned_elements if item[2])
+        return combined if combined.strip() else (page.get_text("text") or "")
+
     @classmethod
     def _extract_pdf(cls, content: bytes, filename: str) -> Tuple[List[ExtractedPage], Dict[str, Any]]:
         """Extract pages and metadata from PDF bytes using PyMuPDF."""
@@ -112,8 +187,8 @@ class DocumentExtractor:
         for i in range(doc.page_count):
             page = doc[i]
             page_num = i + 1
-            # Extract plain text preserving layout flow
-            text = page.get_text("text") or ""
+            # Extract text while preserving PDF table row/column structure
+            text = cls._extract_pdf_page_text(page)
             total_chars += len(text.strip())
 
             pages.append(

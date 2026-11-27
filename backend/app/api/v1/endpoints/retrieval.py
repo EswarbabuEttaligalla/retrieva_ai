@@ -4,9 +4,15 @@ Exposes the Phase 4 retrieval engine directly for inspection, testing,
 and diagnostic relevance analysis without invoking the LLM generation pipeline.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import Optional
 
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.security import HTTPAuthorizationCredentials
+
+from backend.app.core.auth import AuthenticatedUser, bearer_scheme, get_current_user
+from backend.app.core.config import Settings, get_settings
 from backend.app.core.logging import get_logger
+from backend.app.repositories.document_repository import resolve_ready_document_ids_for_request
 from backend.app.retrieval.retriever import Retriever, get_retriever
 from backend.app.schemas.retrieval import RetrievalRequest, RetrievalResult
 
@@ -29,7 +35,11 @@ logger = get_logger("api.endpoints.retrieval")
 )
 async def search_documents(
     request: RetrievalRequest,
+    http_request: Request,
     retriever: Retriever = Depends(get_retriever),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+    settings: Settings = Depends(get_settings),
 ) -> RetrievalResult:
     """Execute standalone multi-stage document retrieval without LLM generation.
 
@@ -47,8 +57,22 @@ async def search_documents(
             detail="Query string cannot be empty or whitespace-only.",
         )
 
+    ready_doc_ids = await resolve_ready_document_ids_for_request(
+        http_request=http_request,
+        current_user=current_user,
+        credentials=credentials,
+        settings=settings,
+    )
+
     try:
-        result = retriever.retrieve(request)
+        if ready_doc_ids is not None:
+            result = retriever.retrieve(
+                request,
+                owner_id=current_user.user_id,
+                authorized_ready_doc_ids=ready_doc_ids,
+            )
+        else:
+            result = retriever.retrieve(request, owner_id=current_user.user_id)
         logger.info(
             "Standalone retrieval completed: mode=%s, query='%s', returned=%d chunks (took %.2f ms)",
             result.mode.value,

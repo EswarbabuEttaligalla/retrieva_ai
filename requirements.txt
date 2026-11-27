@@ -26,3 +26,6 @@ chromadb>=0.4.24
 # LLM Answer Generation & Evaluation (Phase 5)
 openai>=1.14.0
 tiktoken>=0.7.0
+
+# Authentication & JWT Verification (Phase 2)
+PyJWT[crypto]>=2.8.0,<3.0.0

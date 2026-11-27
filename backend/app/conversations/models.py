@@ -26,6 +26,7 @@ class MessageRecord(BaseModel):
     rewritten_query: Optional[str] = Field(default=None, description="Standalone rewritten retrieval query if role=user")
     created_at: str = Field(description="UTC ISO-8601 creation timestamp")
     metadata: Optional[Dict[str, Any]] = Field(default=None, description="Serialized execution metadata, citations, and diagnostics")
+    citations: List[Dict[str, Any]] = Field(default_factory=list, description="Structured verified citations for assistant turns")
 
 
 class ConversationRecord(BaseModel):

@@ -71,6 +71,11 @@ def mock_llm_client():
 # 1. RAG Service Unit / Pipeline Orchestration Tests
 # ============================================================================
 
+from uuid import UUID
+
+TEST_OWNER_ID = UUID("11111111-1111-4111-8111-111111111111")
+
+
 class TestRAGServicePipeline:
     """Test suite for RAGService orchestration flow."""
 
@@ -118,7 +123,7 @@ class TestRAGServicePipeline:
         )
 
         req = AnswerRequest(query="What is Reciprocal Rank Fusion?")
-        response = service.answer_question(req)
+        response = service.answer_question(req, owner_id=TEST_OWNER_ID)
 
         assert isinstance(response, AnswerResponse)
         assert "Reciprocal Rank Fusion" in response.answer
@@ -150,7 +155,7 @@ class TestRAGServicePipeline:
 
         service = RAGService(retriever=mock_retriever, llm_client=mock_llm_client)
         req = AnswerRequest(query="Nonexistent topic query")
-        response = service.answer_question(req)
+        response = service.answer_question(req, owner_id=TEST_OWNER_ID)
 
         assert response.insufficient_context is True
         assert "do not contain any information relevant" in response.answer
@@ -182,7 +187,7 @@ class TestRAGServicePipeline:
 
         service = RAGService(retriever=mock_retriever, llm_client=mock_llm_client)
         req = AnswerRequest(query="What is the capital of Mars?")
-        response = service.answer_question(req)
+        response = service.answer_question(req, owner_id=TEST_OWNER_ID)
 
         assert response.insufficient_context is True
         assert len(response.citations) == 0
@@ -191,7 +196,7 @@ class TestRAGServicePipeline:
         """Whitespace query must be rejected before retrieval execution."""
         service = RAGService(retriever=mock_retriever, llm_client=mock_llm_client)
         with pytest.raises(ValueError) as exc:
-            service.answer_question(AnswerRequest(query="   "))
+            service.answer_question(AnswerRequest(query="   "), owner_id=TEST_OWNER_ID)
         assert "cannot be empty" in str(exc.value)
 
     def test_safe_rejection_on_fabricated_citation(self, mock_retriever, mock_llm_client):
@@ -222,7 +227,7 @@ class TestRAGServicePipeline:
         }
 
         service = RAGService(retriever=mock_retriever, llm_client=mock_llm_client)
-        response = service.answer_question(AnswerRequest(query="Test query"))
+        response = service.answer_question(AnswerRequest(query="Test query"), owner_id=TEST_OWNER_ID)
 
         # The unsafe generated answer MUST BE REJECTED entirely
         assert "could not be verified because it referenced invalid" in response.answer
@@ -268,7 +273,7 @@ class TestRAGServicePipeline:
             llm_client=mock_llm_client,
             context_builder=ContextBuilder(max_context_tokens=60),
         )
-        response = service.answer_question(AnswerRequest(query="Test query"))
+        response = service.answer_question(AnswerRequest(query="Test query"), owner_id=TEST_OWNER_ID)
 
         assert response.insufficient_context is True
         assert "could not be verified" in response.answer
@@ -285,7 +290,7 @@ class TestRAGServicePipeline:
             service.answer_question(AnswerRequest(
                 query="Explain the complete architecture in depth.",
                 max_tokens=3800,
-            ))
+            ), owner_id=TEST_OWNER_ID)
 
         assert "exceed total request token limit" in str(exc.value)
         # Neither retrieval nor LLM should have been called!
@@ -319,7 +324,7 @@ class TestRAGServicePipeline:
         }
 
         service = RAGService(retriever=mock_retriever, llm_client=mock_llm_client)
-        response = service.answer_question(AnswerRequest(query="General question"))
+        response = service.answer_question(AnswerRequest(query="General question"), owner_id=TEST_OWNER_ID)
 
         assert response.answer == "This is a general response without citations."
         assert response.insufficient_context is False
@@ -336,8 +341,14 @@ class TestAnswerAPIEndpoint:
 
     @pytest.fixture
     def client(self):
-        yield TestClient(app)
-        app.dependency_overrides.clear()
+        prev_rag = app.dependency_overrides.get(get_rag_service)
+        try:
+            yield TestClient(app)
+        finally:
+            if prev_rag is None:
+                app.dependency_overrides.pop(get_rag_service, None)
+            else:
+                app.dependency_overrides[get_rag_service] = prev_rag
 
     def test_answer_endpoint_success(self, client):
         """Successful POST /api/v1/answer returns 200 with complete AnswerResponse schema."""

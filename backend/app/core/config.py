@@ -2,9 +2,9 @@
 
 import json
 from functools import lru_cache
-from typing import List, Union
+from typing import List, Optional, Union
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     # Document Upload & Processing Settings (Phase 6)
     MAX_UPLOAD_SIZE_BYTES: int = 10 * 1024 * 1024  # 10 MB
     ALLOWED_UPLOAD_EXTENSIONS: List[str] = [".pdf", ".txt"]
+    STALE_INGESTION_TIMEOUT_SECONDS: int = 300  # 5 minutes
 
     # Embedding Settings (Phase 3)
     EMBEDDING_MODEL_NAME: str = "sentence-transformers/all-MiniLM-L6-v2"
@@ -47,6 +48,7 @@ class Settings(BaseSettings):
     # Vector Storage Settings (Phase 3)
     CHROMA_PERSIST_DIRECTORY: str = "chroma_data"
     CHROMA_COLLECTION_NAME: str = "retrieva_documents"
+    BM25_MAX_CACHED_TENANTS: int = 50
 
     # LLM Answer Generation & RAG Orchestration Settings (Phase 5)
     LLM_PROVIDER: str = "gemini"
@@ -68,6 +70,20 @@ class Settings(BaseSettings):
     CONVERSATION_HISTORY_WINDOW: int = 5  # Number of recent turns (query/answer pairs)
     QUERY_REWRITE_ENABLED: bool = True
     QUERY_REWRITE_TIMEOUT: float = 10.0
+
+    # Supabase JWT Authentication Settings (Phase 2 - never include service-role key)
+    SUPABASE_URL: Optional[str] = None
+    SUPABASE_ANON_KEY: Optional[str] = None
+    SUPABASE_STORAGE_BUCKET: str = "retrieva-user-documents"
+    SUPABASE_JWKS_URL: Optional[str] = None
+    SUPABASE_JWT_ISSUER: Optional[str] = None
+    SUPABASE_JWT_AUDIENCE: str = "authenticated"
+    SUPABASE_JWT_ALGORITHMS: List[str] = ["ES256", "RS256"]
+    SUPABASE_JWKS_CACHE_TTL_SECONDS: int = 300
+    SUPABASE_JWKS_TIMEOUT_SECONDS: float = 5.0
+    SUPABASE_REST_TIMEOUT_SECONDS: float = 10.0
+    BACKEND_RPC_HMAC_SECRET: Optional[str] = None
+    AUTH_ENABLED: bool = True
 
     @field_validator("LLM_PROVIDER", mode="before")
     @classmethod
@@ -114,6 +130,99 @@ class Settings(BaseSettings):
             except json.JSONDecodeError:
                 pass
         return v  # type: ignore
+
+    @field_validator("SUPABASE_JWT_ALGORITHMS", mode="before")
+    @classmethod
+    def validate_jwt_algorithms(cls, v: Union[str, List[str]]) -> List[str]:
+        """Parse and strictly allowlist asymmetric JWT signing algorithms."""
+        if isinstance(v, str):
+            stripped = v.strip()
+            if stripped.startswith("["):
+                try:
+                    parsed = json.loads(stripped)
+                    items = [str(item).strip() for item in parsed] if isinstance(parsed, list) else []
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Invalid SUPABASE_JWT_ALGORITHMS JSON: {exc}") from exc
+            else:
+                items = [item.strip() for item in stripped.split(",") if item.strip()]
+        else:
+            items = [str(item).strip() for item in v]
+
+        allowed = {"ES256", "RS256"}
+        if not items:
+            raise ValueError("SUPABASE_JWT_ALGORITHMS must not be empty.")
+        disallowed = [alg for alg in items if alg not in allowed]
+        if disallowed:
+            raise ValueError(
+                f"Unsupported JWT algorithm(s) {disallowed}. Allowed asymmetric algorithms: {sorted(allowed)}."
+            )
+        return items
+
+    @field_validator("SUPABASE_JWKS_CACHE_TTL_SECONDS")
+    @classmethod
+    def validate_jwks_cache_ttl(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("SUPABASE_JWKS_CACHE_TTL_SECONDS must be positive.")
+        return value
+
+    @field_validator("SUPABASE_JWKS_TIMEOUT_SECONDS")
+    @classmethod
+    def validate_jwks_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("SUPABASE_JWKS_TIMEOUT_SECONDS must be positive.")
+        return value
+
+    @field_validator("SUPABASE_REST_TIMEOUT_SECONDS")
+    @classmethod
+    def validate_rest_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("SUPABASE_REST_TIMEOUT_SECONDS must be positive.")
+        return value
+
+    @field_validator("BM25_MAX_CACHED_TENANTS")
+    @classmethod
+    def validate_bm25_max_cached_tenants(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("BM25_MAX_CACHED_TENANTS must be at least 1.")
+        return value
+
+    @property
+    def resolved_jwks_url(self) -> Optional[str]:
+        """Return explicit JWKS URL or derive it from SUPABASE_URL."""
+        if self.SUPABASE_JWKS_URL and self.SUPABASE_JWKS_URL.strip():
+            return self.SUPABASE_JWKS_URL.strip()
+        if self.SUPABASE_URL and self.SUPABASE_URL.strip():
+            return f"{self.SUPABASE_URL.strip().rstrip('/')}/auth/v1/.well-known/jwks.json"
+        return None
+
+    @property
+    def resolved_issuer(self) -> Optional[str]:
+        """Return explicit JWT issuer or derive it from SUPABASE_URL."""
+        if self.SUPABASE_JWT_ISSUER and self.SUPABASE_JWT_ISSUER.strip():
+            return self.SUPABASE_JWT_ISSUER.strip()
+        if self.SUPABASE_URL and self.SUPABASE_URL.strip():
+            return f"{self.SUPABASE_URL.strip().rstrip('/')}/auth/v1"
+        return None
+
+    @model_validator(mode="after")
+    def validate_production_auth_fail_closed(self) -> "Settings":
+        """Fail closed when authentication configuration is missing or disabled outside development."""
+        env = self.APP_ENV.strip().lower()
+        if env != "development":
+            if not self.AUTH_ENABLED:
+                raise ValueError(
+                    f"AUTH_ENABLED cannot be False when APP_ENV='{self.APP_ENV}'."
+                )
+            if not self.resolved_jwks_url or not self.resolved_issuer:
+                raise ValueError(
+                    "Supabase authentication configuration is required outside development "
+                    "(set SUPABASE_URL, or both SUPABASE_JWKS_URL and SUPABASE_JWT_ISSUER)."
+                )
+            if not self.SUPABASE_JWT_AUDIENCE or not self.SUPABASE_JWT_AUDIENCE.strip():
+                raise ValueError("SUPABASE_JWT_AUDIENCE must be configured outside development.")
+            if not self.BACKEND_RPC_HMAC_SECRET or not self.BACKEND_RPC_HMAC_SECRET.strip():
+                raise ValueError("BACKEND_RPC_HMAC_SECRET must be configured outside development.")
+        return self
 
     model_config = SettingsConfigDict(
         env_file=(".env", "backend/.env"),

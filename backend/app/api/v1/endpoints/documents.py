@@ -1,24 +1,43 @@
-"""Document management endpoints for Retrieva AI.
+"""Tenant-isolated document management endpoints for Retrieva AI.
 
-Provides REST APIs for document uploading, listing ingested documents,
-and deleting documents with atomic ChromaDB and BM25 index synchronization.
+Provides REST APIs for uploading documents to private Supabase Storage,
+persisting metadata in Supabase public.documents, indexing owner-scoped chunks
+into ChromaDB, listing user-owned documents, and atomically deleting documents.
 """
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 
+from backend.app.core.auth import AuthenticatedUser, get_current_user
 from backend.app.core.config import get_settings
 from backend.app.core.logging import get_logger
+from backend.app.core.supabase_client import (
+    SupabaseClientError,
+    SupabaseConflictError,
+    SupabaseForbiddenError,
+    SupabaseNotFoundError,
+    SupabaseUnauthorizedError,
+    SupabaseUnavailableError,
+    SupabaseValidationError,
+)
 from backend.app.document_processing.exceptions import (
     CorruptedPDFError,
     EmptyDocumentError,
+    EncodingError,
     EncryptedPDFError,
     NoExtractableTextError,
     UnsupportedFileTypeError,
-    EncodingError,
+)
+from backend.app.repositories.document_repository import (
+    DocumentRepository,
+    get_document_repository,
+)
+from backend.app.repositories.storage_repository import (
+    SupabaseStorageRepository,
+    get_storage_repository,
 )
 from backend.app.retrieval.retriever import Retriever, get_retriever
 from backend.app.schemas.document import (
@@ -28,6 +47,7 @@ from backend.app.schemas.document import (
     DocumentUploadResponse,
 )
 from backend.app.services.ingestion_service import (
+    DocumentInProgressError,
     IngestionService,
     get_ingestion_service,
 )
@@ -53,25 +73,67 @@ ALLOWED_MIME_TYPES = {
 }
 
 
+def _raise_for_supabase_error(exc: SupabaseClientError, fallback_detail: str) -> None:
+    if isinstance(exc, SupabaseUnauthorizedError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication credentials were invalid.",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+    if isinstance(exc, SupabaseForbiddenError):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=exc.message,
+        ) from exc
+    if isinstance(exc, SupabaseConflictError):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=exc.message,
+        ) from exc
+    if isinstance(exc, SupabaseValidationError):
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.message,
+        ) from exc
+    if isinstance(exc, SupabaseNotFoundError):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found.",
+        ) from exc
+    if isinstance(exc, SupabaseUnavailableError):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=exc.message,
+        ) from exc
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail=fallback_detail,
+    ) from exc
+
+
 @router.post(
     "/upload",
     response_model=DocumentUploadResponse,
     status_code=status.HTTP_200_OK,
     summary="Upload and Index Document",
-    description="Accepts PDF or TXT documents, validates file integrity and size, extracts text, generates chunk embeddings, and indexes into persistent vector store.",
+    description="Accepts PDF or TXT documents, stores the raw file in private Supabase Storage, and indexes owner-scoped chunks into ChromaDB.",
 )
 async def upload_document(
     file: UploadFile = File(...),
     ingestion_service: IngestionService = Depends(get_ingestion_service),
     retriever: Retriever = Depends(get_retriever),
+    doc_repo: DocumentRepository = Depends(get_document_repository),
+    storage_repo: SupabaseStorageRepository = Depends(get_storage_repository),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> DocumentUploadResponse:
-    """Handle document file upload, validation, chunking, and vector indexing."""
+    """Handle tenant-isolated document upload, Storage persistence, and vector indexing."""
     settings = get_settings()
 
     # 1. Filename & Path Traversal Protection
     raw_filename = file.filename or ""
     clean_filename = Path(raw_filename).name.replace("\0", "").strip()
     if not clean_filename or clean_filename in {".", ".."}:
+        await file.close()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="A valid document filename is required.",
@@ -80,6 +142,7 @@ async def upload_document(
     # 2. Extension Allowlist
     file_ext = Path(clean_filename).suffix.lower()
     if file_ext not in settings.ALLOWED_UPLOAD_EXTENSIONS:
+        await file.close()
         logger.warning("Rejected file '%s': unsupported extension '%s'", clean_filename, file_ext)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -91,6 +154,7 @@ async def upload_document(
         mime = file.content_type.split(";")[0].strip().lower()
         allowed_mimes = ALLOWED_MIME_TYPES.get(file_ext, [])
         if mime and mime not in allowed_mimes:
+            await file.close()
             logger.warning(
                 "Rejected file '%s': unsupported MIME type '%s' for extension '%s'",
                 clean_filename,
@@ -103,7 +167,7 @@ async def upload_document(
             )
 
     # 4. Streaming Content Reading & Proactive Size Enforcement
-    chunk_size = 64 * 1024  # 64 KB streaming buffer
+    chunk_size = 64 * 1024
     total_bytes = 0
     buffer_list = []
     max_mb = settings.MAX_UPLOAD_SIZE_BYTES // (1024 * 1024)
@@ -154,14 +218,12 @@ async def upload_document(
                 detail="Invalid PDF file format: missing '%PDF' header or file is corrupted.",
             )
     elif file_ext == ".txt":
-        # Reject binary null bytes
         if b"\x00" in file_bytes:
             logger.warning("Rejected file '%s': binary null bytes detected", clean_filename)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid TXT file format: binary null bytes detected.",
             )
-        # Enforce valid UTF-8 (supporting standard UTF-8 and UTF-8 with BOM)
         try:
             file_bytes.decode("utf-8-sig")
         except UnicodeDecodeError as exc:
@@ -171,68 +233,70 @@ async def upload_document(
                 detail=f"Invalid TXT file format: text must be valid UTF-8 encoded ({str(exc)}).",
             )
 
-    # 7. Execute Ingestion Pipeline
+    # 7. Execute Tenant-Isolated Ingestion Pipeline
     try:
-        result = ingestion_service.ingest_document(
-            file_input=file_bytes,
+        result = await ingestion_service.ingest_document_for_user(
+            file_bytes=file_bytes,
             filename=clean_filename,
-            prevent_duplicates=True,
+            owner_id=current_user.user_id,
+            doc_repo=doc_repo,
+            storage_repo=storage_repo,
+            declared_mime=file.content_type,
         )
-    except EmptyDocumentError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-    except EncryptedPDFError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-    except CorruptedPDFError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-    except NoExtractableTextError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-    except UnsupportedFileTypeError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-    except EncodingError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except DocumentInProgressError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except SupabaseClientError as exc:
+        _raise_for_supabase_error(exc, "Failed to persist document metadata or storage object.")
+    except (
+        EmptyDocumentError,
+        EncryptedPDFError,
+        CorruptedPDFError,
+        NoExtractableTextError,
+        UnsupportedFileTypeError,
+        EncodingError,
+    ) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except VectorStoreInsertionError as exc:
         logger.error("ChromaDB vector insertion failed for '%s': %s", clean_filename, exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to persist document chunks in vector store: {str(exc)}",
-        )
+        ) from exc
     except Exception as exc:
         logger.error("Unexpected ingestion failure for '%s': %s", clean_filename, exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Unexpected error while processing document: {str(exc)}",
-        )
+        ) from exc
 
-    # 6. Synchronize BM25 Index on Successful Ingestion
-    if result.status == "success":
+    # 8. Synchronize Owner-Scoped BM25 Index on Successful Ingestion
+    if (
+        result.status == "success"
+        and result.chunks
+        and ingestion_service.tenant_bm25_manager is not retriever.tenant_bm25_manager
+    ):
         try:
-            retriever.sync_bm25_with_vector_store()
-            logger.info("Synchronized BM25 index after ingesting '%s'", result.document_id)
+            added_bm25 = retriever.sync_owner_chunks(current_user.user_id, result.chunks)
+            logger.info(
+                "Synchronized owner BM25 index (%d chunks) after ingesting '%s'",
+                added_bm25,
+                result.document_id,
+            )
         except Exception as exc:
             logger.warning("BM25 sync after ingestion warning: %s", exc)
 
-    # 7. Formulate Response
     if result.is_duplicate or result.status == "duplicate":
-        stored_chunks = 0
-        if result.metadata and getattr(result.metadata, "total_chunks", 0):
-            stored_chunks = result.metadata.total_chunks
-        else:
-            try:
-                stored_chunks = len(ingestion_service.vector_store.get_document_chunks(result.document_id))
-            except Exception:
-                stored_chunks = 0
-
         return DocumentUploadResponse(
             document_id=result.document_id,
             filename=result.filename,
             content_hash=result.content_hash,
             file_size_bytes=len(file_bytes),
             total_pages=result.total_pages,
-            total_chunks=stored_chunks,
+            total_chunks=result.total_chunks,
             status="duplicate",
             created_at=result.metadata.created_at if result.metadata else datetime.now(timezone.utc),
             is_duplicate=True,
-            message=f"Document '{clean_filename}' with identical SHA-256 hash is already indexed in the system.",
+            message=f"Document '{result.filename}' with identical SHA-256 hash is already indexed in your knowledge base.",
         )
 
     return DocumentUploadResponse(
@@ -245,7 +309,7 @@ async def upload_document(
         status="success",
         created_at=result.metadata.created_at if result.metadata else datetime.now(timezone.utc),
         is_duplicate=False,
-        message=f"Document '{clean_filename}' was successfully indexed into {result.total_chunks} chunks.",
+        message=f"Document '{result.filename}' was successfully indexed into {result.total_chunks} chunks.",
     )
 
 
@@ -254,20 +318,22 @@ async def upload_document(
     response_model=DocumentListResponse,
     status_code=status.HTTP_200_OK,
     summary="List Ingested Documents",
-    description="Retrieve catalog of all documents currently ingested, including file size, page count, and chunk counts.",
+    description="Retrieve catalog of all ready documents owned by the authenticated user.",
 )
 async def list_documents(
-    ingestion_service: IngestionService = Depends(get_ingestion_service),
+    doc_repo: DocumentRepository = Depends(get_document_repository),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> DocumentListResponse:
-    """Return all registered documents in the knowledge base."""
-    # Ensure in-memory registry is reconciled with ChromaDB if needed
-    if ingestion_service.registry.count() == 0 and ingestion_service.vector_store.count() > 0:
-        ingestion_service.registry.reconcile_from_vector_store(ingestion_service.vector_store)
+    """Return only ready documents belonging to the authenticated user."""
+    try:
+        docs = await doc_repo.list_documents(owner_id=current_user.user_id)
+    except SupabaseClientError as exc:
+        _raise_for_supabase_error(exc, "Failed to retrieve document catalog.")
 
-    docs = ingestion_service.registry.get_all()
+    ready_docs = [doc for doc in docs if doc.processing_status == "ready"]
     items = [
         DocumentListItem(
-            document_id=doc.document_id,
+            document_id=str(doc.id),
             filename=doc.filename,
             file_extension=doc.file_extension,
             file_size_bytes=doc.file_size_bytes,
@@ -275,7 +341,7 @@ async def list_documents(
             total_chunks=doc.total_chunks,
             created_at=doc.created_at,
         )
-        for doc in docs
+        for doc in ready_docs
     ]
     return DocumentListResponse(documents=items, total=len(items))
 
@@ -285,77 +351,72 @@ async def list_documents(
     response_model=DocumentDeleteResponse,
     status_code=status.HTTP_200_OK,
     summary="Delete Document",
-    description="Permanently delete a document and its vector chunks from the vector store and registry, synchronizing BM25 index.",
+    description="Permanently delete an owned document from ChromaDB, Supabase Storage, and Supabase metadata.",
 )
 async def delete_document(
     document_id: str,
     ingestion_service: IngestionService = Depends(get_ingestion_service),
     retriever: Retriever = Depends(get_retriever),
+    doc_repo: DocumentRepository = Depends(get_document_repository),
+    storage_repo: SupabaseStorageRepository = Depends(get_storage_repository),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> DocumentDeleteResponse:
-    """Delete a document by its document_id."""
-    clean_id = document_id.strip()
+    """Delete an owned document by UUID; returns 404 for nonexistent or foreign documents."""
+    clean_id = (document_id or "").strip()
     if not clean_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Document ID cannot be empty.",
         )
 
-    has_in_registry = bool(ingestion_service.registry.get_by_id(clean_id))
-    has_in_store = ingestion_service.vector_store.has_document(clean_id)
-
-    if not has_in_registry and not has_in_store:
-        logger.warning("Attempted to delete nonexistent document '%s'", clean_id)
+    try:
+        doc_uuid = UUID(clean_id)
+    except ValueError as exc:
+        # Uniform 404 avoids leaking ID structure or existence across tenants
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Document with ID '{clean_id}' not found.",
-        )
+            detail="Document not found.",
+        ) from exc
 
-    # Step 1: Delete chunks from ChromaDB persistent vector store
     try:
-        deleted_chunks = ingestion_service.vector_store.delete_document(clean_id)
+        deleted_chunks = await ingestion_service.delete_document_for_user(
+            document_id=doc_uuid,
+            owner_id=current_user.user_id,
+            doc_repo=doc_repo,
+            storage_repo=storage_repo,
+        )
+    except SupabaseClientError as exc:
+        _raise_for_supabase_error(exc, "Failed to delete document.")
     except Exception as exc:
-        logger.error("Failed to delete document '%s' from vector store: %s", clean_id, exc)
+        logger.error("Failed deleting document '%s' for owner '%s': %s", doc_uuid, current_user.user_id, exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete document chunks from vector store: {str(exc)}",
-        )
+            detail="Failed to delete document cleanly; please retry.",
+        ) from exc
 
-    # Step 2: Remove from Document Registry with disk persistence
-    try:
-        ingestion_service.registry.remove(clean_id, raise_on_error=True)
-    except Exception as exc:
-        logger.error(
-            "ChromaDB chunks deleted for '%s', but metadata persistence failed: %s. Initiating reconciliation recovery...",
-            clean_id,
-            exc,
-        )
-        try:
-            ingestion_service.registry.reconcile_from_vector_store(
-                ingestion_service.vector_store, prune_orphans=True
-            )
-        except Exception as rec_exc:
-            logger.error("Automated reconciliation recovery failed: %s", rec_exc)
-
+    if deleted_chunks is None:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Vector chunks for '{clean_id}' were deleted, but metadata registry persistence failed: {str(exc)}. State reconciliation was initiated.",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found.",
         )
 
-    # Step 3: Rebuild BM25 in-memory keyword index
     try:
-        retriever.sync_bm25_with_vector_store()
-        logger.info("Synchronized BM25 index after deleting document '%s'", clean_id)
+        removed_bm25 = retriever.remove_owner_document(current_user.user_id, str(doc_uuid))
+        logger.info(
+            "Synchronized owner BM25 index (removed %d chunks) after deleting document '%s'",
+            removed_bm25,
+            doc_uuid,
+        )
     except Exception as exc:
-        logger.error("BM25 sync after deletion failed for document '%s': %s", clean_id, exc)
+        logger.error("BM25 sync after deletion failed for document '%s': %s", doc_uuid, exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Document was removed from persistent stores, but BM25 keyword index synchronization failed: {str(exc)}",
-        )
+        ) from exc
 
-    logger.info("Successfully deleted document '%s' (%d chunks removed)", clean_id, deleted_chunks)
     return DocumentDeleteResponse(
-        document_id=clean_id,
+        document_id=str(doc_uuid),
         deleted_chunks=deleted_chunks,
         status="deleted",
-        message=f"Document '{clean_id}' and all associated {deleted_chunks} chunks were successfully deleted.",
+        message=f"Document '{doc_uuid}' and all associated {deleted_chunks} chunks were successfully deleted.",
     )

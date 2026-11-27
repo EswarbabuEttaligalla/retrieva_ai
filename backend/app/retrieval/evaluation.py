@@ -4,8 +4,11 @@ Calculates Precision@K, Recall@K, Mean Reciprocal Rank (MRR), and Hit Rate@K
 across Dense, BM25, and Hybrid retrieval strategies over a 48-chunk, 20-query ground-truth benchmark.
 """
 
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Union
+from uuid import UUID
 from pydantic import BaseModel
+
+EVAL_OWNER_ID = UUID("00000000-0000-4000-8000-000000000000")
 
 try:
     from backend.app.core.logging import get_logger
@@ -642,7 +645,7 @@ def run_retrieval_benchmark(
                     enable_reranking=False,
                 ),
             )
-            res = retriever.retrieve(request)
+            res = retriever.retrieve(request, owner_id=EVAL_OWNER_ID)
             retrieved_ids = [c.chunk_id for c in res.chunks]
 
             reciprocal_ranks.append(calculate_reciprocal_rank(retrieved_ids, relevant_set))

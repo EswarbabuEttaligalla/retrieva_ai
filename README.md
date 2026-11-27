@@ -324,3 +324,56 @@ All tests run against standard FastAPI TestClient and async HTTPX clients.
   - 43 automated backend tests in `test_conversations.py` covering schema, repository, rewriter, non-contamination, cancellation, API routes, event loop responsiveness, per-conversation lock serialization, and prompt injection defense
   - 9 newly added frontend tests (5 client API tests + 4 component tests) in `client.test.mjs` and `components.test.jsx` (42 total frontend tests)
   - Total automated test suite: 235 backend tests (234 passed, 0 failed, 1 skipped) + 42 frontend tests (42 passed, 0 failed) = 277 collected, 276 passed, 0 failed, 1 skipped (100% of executed tests passed)
+
+---
+
+## 🚀 Production Deployment Guide (Single-Instance)
+
+### Prerequisites
+- Python 3.10+ with virtual environment (`backend/requirements.txt`)
+- Node.js 18+ and `npm`
+- Linked Supabase project with Auth, PostgreSQL, Vault, and private Storage (`retrieva-user-documents`)
+- Persistent local volume/directory for ChromaDB (`CHROMA_PERSIST_DIRECTORY`, default `chroma_data`)
+
+### Required Environment Variables (Names Only)
+**Backend (`.env` or host environment):**
+- `APP_ENV` (`production`), `AUTH_ENABLED` (`true`), `DEBUG` (`false`)
+- `BACKEND_CORS_ORIGINS` (explicitly restricted frontend origin(s))
+- `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_STORAGE_BUCKET`
+- `SUPABASE_JWT_AUDIENCE` (`authenticated`), `SUPABASE_JWT_ALGORITHMS` (`ES256,RS256`)
+- `BACKEND_RPC_HMAC_SECRET` (must match Supabase Vault secret `retrieva_backend_rpc_hmac_secret`)
+- `LLM_PROVIDER` (`gemini` or `openai`), plus `GEMINI_API_KEY` / `GEMINI_MODEL` or `OPENAI_API_KEY` / `OPENAI_MODEL`
+- `CHROMA_PERSIST_DIRECTORY`, `CHROMA_COLLECTION_NAME`, `STALE_INGESTION_TIMEOUT_SECONDS` (default `300`)
+
+**Frontend (`frontend/.env.production` or build-time env):**
+- `VITE_SUPABASE_URL`
+- `VITE_SUPABASE_ANON_KEY`
+- `VITE_API_BASE_URL` (e.g., `https://api.example.com/api/v1`)
+
+> Never set a Supabase service-role key in either backend or frontend configuration.
+
+### Supabase Configuration Requirements
+1. Apply all migrations in `supabase/migrations/` (`20261125061000`, `20261125061100`, `20261126084500`).
+2. Provision Vault secret `retrieva_backend_rpc_hmac_secret` matching `BACKEND_RPC_HMAC_SECRET`.
+3. Ensure RLS is enabled on `public.profiles`, `public.documents`, `public.conversations`, `public.messages`, and `storage.objects`, with bucket `retrieva-user-documents` set to `public = false`.
+
+### Backend Startup (Single-Worker Restriction)
+```bash
+uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --workers 1
+```
+- **Single-worker restriction (`--workers 1`):** Required because embedded `ChromaVectorStore` (`PersistentClient`) and `TenantBM25Manager` (in-memory LRU cache) are process-local. Multi-worker deployment is not supported in this release.
+- **Persistent storage:** Mount `CHROMA_PERSIST_DIRECTORY` (`chroma_data/`) on durable disk so vector embeddings and BM25 restart hydration survive container/process restarts.
+- **Health-check endpoint:** `GET /api/v1/health` (returns HTTP `200` with `{"status": "healthy"}`).
+
+### Frontend Production Build & Deployment
+```bash
+cd frontend
+npm ci
+npm run build
+```
+Serve the generated static bundle in `frontend/dist/` over HTTPS (e.g., Nginx, Vercel, Cloudflare Pages, or S3+CloudFront) and ensure its exact origin is listed in `BACKEND_CORS_ORIGINS`.
+
+### Known Limitations
+- **Single-instance only:** Horizontal scaling (`--workers > 1`) requires migrating ChromaDB to client/server mode and adding cross-worker BM25 cache invalidation.
+- **Ready-document snapshot TOCTOU:** Millisecond window between `list_ready_document_ids` and retrieval execution within a single request.
+- **Stale `deleting` state:** `deleting` documents are not auto-reaped by stale recovery and require `DELETE /api/v1/documents/{document_id}` retry.

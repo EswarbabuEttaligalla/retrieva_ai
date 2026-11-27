@@ -47,9 +47,13 @@ import shutil
 import sqlite3
 import tempfile
 import time
-from typing import Generator
+from datetime import datetime, timezone
+from typing import Any, Dict, Generator, List
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs
+from uuid import UUID, uuid4
 
+import httpx
 import pytest
 from starlette.testclient import TestClient
 
@@ -60,19 +64,27 @@ from backend.app.conversations.models import (
     MessageRecord,
 )
 from backend.app.conversations.query_rewriter import ConversationalQueryRewriter
-from backend.app.conversations.repository import ConversationRepository, get_conversation_repository
+from backend.app.conversations.repository import ConversationRepository
 from backend.app.conversations.service import (
     ConversationNotFoundError,
     ConversationService,
     get_conversation_service,
 )
 from backend.app.core.config import get_settings
+from backend.app.core.supabase_client import SupabaseClient
 from backend.app.document_processing.chunker import DocumentChunk
 from backend.app.embeddings.embedder import SentenceTransformerEmbedder
 from backend.app.llm.client import OpenAIClient
 from backend.app.llm.exceptions import LLMError, LLMTimeoutError
 from backend.app.main import app
-from backend.app.retrieval.bm25 import BM25Index
+from backend.app.repositories.conversation_repository import (
+    SupabaseConversationRepository,
+    get_supabase_conversation_repository,
+)
+from backend.app.repositories.message_repository import (
+    SupabaseMessageRepository,
+    get_message_repository,
+)
 from backend.app.retrieval.dense import DenseRetriever
 from backend.app.retrieval.retriever import Retriever
 from backend.app.schemas.answer import AnswerRequest
@@ -80,10 +92,128 @@ from backend.app.schemas.retrieval import RetrievedChunk
 from backend.app.services.rag_service import RAGService, get_rag_service
 from backend.app.vector_store.store import ChromaVectorStore
 
+TEST_CONV_OWNER_ID = UUID("11111111-1111-4111-8111-111111111111")
+TEST_SUPABASE_URL = "https://zblfcosunplvnnwjfyjz.supabase.co"
+
+
+class InMemorySupabaseConvBackend:
+    """In-memory PostgREST + RPC simulator for conversation & message repository tests."""
+
+    def __init__(self, owner_id: UUID = TEST_CONV_OWNER_ID) -> None:
+        self.owner_id = str(owner_id)
+        self.conversations: Dict[str, Dict[str, Any]] = {}
+        self.messages: List[Dict[str, Any]] = []
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        qs = parse_qs(request.url.query.decode("utf-8")) if request.url.query else {}
+        body = json.loads(request.content.decode("utf-8")) if request.content else {}
+        now = datetime.now(timezone.utc).isoformat()
+
+        if path == "/rest/v1/rpc/record_assistant_message" and request.method == "POST":
+            cid = body["p_conversation_id"]
+            conv = self.conversations.get(cid)
+            if not conv or conv["owner_id"] != self.owner_id:
+                return httpx.Response(403, json={"code": "42501", "message": "Conversation not found or not owned by caller"})
+            row = {
+                "id": str(uuid4()),
+                "conversation_id": cid,
+                "owner_id": self.owner_id,
+                "role": "assistant",
+                "content": body["p_content"],
+                "raw_query": None,
+                "rewritten_query": None,
+                "metadata": body.get("p_metadata", {}),
+                "citations": body.get("p_citations", []),
+                "created_at": now,
+            }
+            self.messages.append(row)
+            conv["updated_at"] = now
+            return httpx.Response(200, json=row)
+
+        if path == "/rest/v1/conversations":
+            if request.method == "POST":
+                cid = str(uuid4())
+                row = {
+                    "id": cid,
+                    "owner_id": self.owner_id,
+                    "title": body.get("title", "New Conversation"),
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                self.conversations[cid] = row
+                return httpx.Response(201, json=[row])
+
+            if request.method == "GET":
+                rows = [r for r in self.conversations.values() if r["owner_id"] == self.owner_id]
+                if "id" in qs:
+                    tid = qs["id"][0].removeprefix("eq.")
+                    rows = [r for r in rows if r["id"] == tid]
+                if qs.get("order") == ["updated_at.desc"]:
+                    rows.sort(key=lambda r: r["updated_at"], reverse=True)
+                offset = int(qs.get("offset", ["0"])[0])
+                limit = int(qs.get("limit", ["100"])[0])
+                return httpx.Response(200, json=rows[offset:offset + limit])
+
+            if request.method == "PATCH":
+                tid = qs["id"][0].removeprefix("eq.")
+                row = self.conversations.get(tid)
+                if not row or row["owner_id"] != self.owner_id:
+                    return httpx.Response(200, json=[])
+                if "title" in body:
+                    row["title"] = body["title"]
+                row["updated_at"] = now
+                return httpx.Response(200, json=[row])
+
+            if request.method == "DELETE":
+                tid = qs["id"][0].removeprefix("eq.")
+                row = self.conversations.get(tid)
+                if not row or row["owner_id"] != self.owner_id:
+                    return httpx.Response(200, json=[])
+                del self.conversations[tid]
+                self.messages = [m for m in self.messages if m["conversation_id"] != tid]
+                return httpx.Response(200, json=[row])
+
+        if path == "/rest/v1/messages":
+            if request.method == "POST":
+                cid = body["conversation_id"]
+                conv = self.conversations.get(cid)
+                if not conv or conv["owner_id"] != self.owner_id:
+                    return httpx.Response(403, json={"code": "42501", "message": "RLS blocked insert"})
+                if body.get("role") != "user":
+                    return httpx.Response(403, json={"code": "42501", "message": "Direct assistant insert forbidden"})
+                row = {
+                    "id": str(uuid4()),
+                    "conversation_id": cid,
+                    "owner_id": self.owner_id,
+                    "role": "user",
+                    "content": body["content"],
+                    "raw_query": body.get("raw_query"),
+                    "rewritten_query": body.get("rewritten_query"),
+                    "metadata": body.get("metadata", {}),
+                    "citations": [],
+                    "created_at": now,
+                }
+                self.messages.append(row)
+                return httpx.Response(201, json=[row])
+
+            if request.method == "GET":
+                rows = [m for m in self.messages if m["owner_id"] == self.owner_id]
+                if "conversation_id" in qs:
+                    cid = qs["conversation_id"][0].removeprefix("eq.")
+                    rows = [m for m in rows if m["conversation_id"] == cid]
+                if qs.get("order") == ["created_at.desc"]:
+                    rows = list(reversed(rows))
+                if "limit" in qs:
+                    rows = rows[:int(qs["limit"][0])]
+                return httpx.Response(200, json=rows)
+
+        return httpx.Response(404, json={"message": "Not found"})
+
 
 @pytest.fixture
 def temp_conv_db() -> Generator[str, None, None]:
-    """Create a temporary SQLite database for test isolation."""
+    """Create a temporary SQLite database for legacy repository isolation tests."""
     temp_dir = tempfile.mkdtemp(prefix="retrieva_conv_test_")
     db_path = os.path.join(temp_dir, "test_conversations.db")
     init_conversation_db(db_path)
@@ -93,18 +223,35 @@ def temp_conv_db() -> Generator[str, None, None]:
 
 @pytest.fixture
 def conv_repo(temp_conv_db: str) -> ConversationRepository:
-    """Create an isolated ConversationRepository."""
+    """Create an isolated legacy ConversationRepository."""
     return ConversationRepository(db_path=temp_conv_db)
 
 
+def _build_supabase_conv_service(rewriter: ConversationalQueryRewriter) -> tuple[ConversationService, SupabaseMessageRepository, InMemorySupabaseConvBackend]:
+    backend = InMemorySupabaseConvBackend(owner_id=TEST_CONV_OWNER_ID)
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(backend.handle))
+    sb_client = SupabaseClient(
+        supabase_url=TEST_SUPABASE_URL,
+        anon_key="test-anon-key",
+        access_token="test-jwt-token",
+        owner_id=TEST_CONV_OWNER_ID,
+        http_client=http_client,
+    )
+    c_repo = SupabaseConversationRepository(sb_client)
+    m_repo = SupabaseMessageRepository(sb_client)
+    svc = ConversationService(conversation_repo=c_repo, message_repo=m_repo, query_rewriter=rewriter)
+    return svc, m_repo, backend
+
+
 @pytest.fixture
-def conv_service(conv_repo: ConversationRepository) -> ConversationService:
-    """Create an isolated ConversationService."""
+def conv_service() -> ConversationService:
+    """Create an isolated Supabase-backed ConversationService with mocked transport."""
     mock_llm = MagicMock(spec=OpenAIClient)
     mock_llm.api_key = "sk-test-key"
     mock_llm.model = "gpt-4o-mini"
     rewriter = ConversationalQueryRewriter(llm_client=mock_llm)
-    return ConversationService(repository=conv_repo, query_rewriter=rewriter)
+    svc, _, _ = _build_supabase_conv_service(rewriter)
+    return svc
 
 
 @pytest.fixture(scope="module")
@@ -114,14 +261,13 @@ def shared_embedder():
 
 
 @pytest.fixture
-def rag_with_conv_fixture(shared_embedder, temp_conv_db: str):
-    """Create an isolated Retriever and RAGService with controlled documents and conversation repo."""
+def rag_with_conv_fixture(shared_embedder):
+    """Create an isolated Retriever and RAGService with Supabase-backed ConversationService."""
     temp_dir = tempfile.mkdtemp(prefix="retrieva_rag_conv_test_")
     store = ChromaVectorStore(
         collection_name="test_rag_conv_collection",
         persist_directory=temp_dir,
     )
-    bm25 = BM25Index()
 
     doc1_chunk = DocumentChunk(
         chunk_id="chunk_retrieva_01",
@@ -153,37 +299,27 @@ def rag_with_conv_fixture(shared_embedder, temp_conv_db: str):
 
     chunks = [doc1_chunk, doc2_chunk]
     embeddings = shared_embedder.embed_batch([c.chunk_text for c in chunks])
-    store.add_chunks(chunks, embeddings, prevent_duplicates=False)
-    for c in chunks:
-        bm25.add_chunk({
-            "chunk_id": c.chunk_id,
-            "document_id": c.document_id,
-            "filename": c.filename,
-            "chunk_text": c.chunk_text,
-            "page_number": c.page_number,
-            "page_references": c.page_references,
-            "start_offset": c.start_offset,
-            "end_offset": c.end_offset,
-        })
+    store.add_chunks(chunks, embeddings, owner_id=TEST_CONV_OWNER_ID, prevent_duplicates=False)
 
     retriever = Retriever(
         dense_retriever=DenseRetriever(embedder=shared_embedder, vector_store=store),
-        bm25_index=bm25,
         vector_store=store,
-        auto_sync_bm25=False,
     )
 
     mock_llm = MagicMock(spec=OpenAIClient)
     mock_llm.api_key = "sk-test-key"
     mock_llm.model = "gpt-4o-mini"
+    mock_llm.rewrite_query = MagicMock(return_value="Standalone query")
+    mock_llm.rewrite_query_async = AsyncMock(return_value="Standalone query")
 
-    repo = ConversationRepository(db_path=temp_conv_db)
-    service = ConversationService(repository=repo)
+    rewriter = ConversationalQueryRewriter(llm_client=mock_llm)
+    service, msg_repo, _ = _build_supabase_conv_service(rewriter)
     rag_service = RAGService(retriever=retriever, llm_client=mock_llm, conversation_service=service)
 
-    yield rag_service, mock_llm, service, repo
-
-    shutil.rmtree(temp_dir, ignore_errors=True)
+    try:
+        yield rag_service, mock_llm, service, msg_repo
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 class TestDatabaseAndRepository:
@@ -302,16 +438,17 @@ class TestDatabaseAndRepository:
         with pytest.raises(sqlite3.IntegrityError):
             conv_repo.add_message("non_existent_conversation_uuid", role="user", content="Ghost message")
 
-    def test_missing_conversation_handling(self, conv_repo: ConversationRepository, conv_service: ConversationService):
+    @pytest.mark.asyncio
+    async def test_missing_conversation_handling(self, conv_repo: ConversationRepository, conv_service: ConversationService):
         """10. Verify missing conversation returns None from repo and raises ConversationNotFoundError in service."""
         assert conv_repo.get_conversation("does_not_exist") is None
         assert conv_repo.delete_conversation("does_not_exist") is False
 
         with pytest.raises(ConversationNotFoundError):
-            conv_service.delete_conversation("does_not_exist")
+            await conv_service.delete_conversation("does_not_exist", owner_id=TEST_CONV_OWNER_ID)
 
         with pytest.raises(ConversationNotFoundError):
-            conv_service.record_user_message("does_not_exist", "query", "query")
+            await conv_service.record_user_message("does_not_exist", TEST_CONV_OWNER_ID, "query", "query")
 
     def test_database_transaction_rollback(self, temp_conv_db: str):
         """11. Verify transaction rolls back if an error occurs mid-transaction."""
@@ -555,12 +692,13 @@ class TestConversationalQueryRewriter:
         )
         assert cleaned == "What is ChromaDB?"
 
-    def test_conversation_history_does_not_become_document_evidence(self, rag_with_conv_fixture):
+    @pytest.mark.asyncio
+    async def test_conversation_history_does_not_become_document_evidence(self, rag_with_conv_fixture):
         """20. Verify that conversation messages are never passed into context_builder as document sources."""
         rag_service, mock_llm, conv_service, _ = rag_with_conv_fixture
-        c = conv_service.create_conversation(title="Evidence Guard")
-        conv_service.record_user_message(c.id, "User query 1", "User query 1")
-        conv_service.record_assistant_message(c.id, "Assistant answer 1 with confidential facts.")
+        c = await conv_service.create_conversation(owner_id=TEST_CONV_OWNER_ID, title="Evidence Guard")
+        await conv_service.record_user_message(c.id, TEST_CONV_OWNER_ID, "User query 1", "User query 1")
+        await conv_service.record_assistant_message(c.id, TEST_CONV_OWNER_ID, "Assistant answer 1 with confidential facts.")
 
         # Spy on context_builder.build_context
         with patch.object(rag_service.context_builder, "build_context", wraps=rag_service.context_builder.build_context) as spy_builder:
@@ -568,7 +706,11 @@ class TestConversationalQueryRewriter:
                 "content": json.dumps({"answer": "Verified answer [Source 1].", "citations": [{"source_id": "[Source 1]"}]}),
                 "model": "gpt-4o-mini",
             }
-            rag_service.answer_question(AnswerRequest(query="What database does Retrieva AI use?", conversation_id=c.id))
+            await rag_service.answer_question_async(
+                AnswerRequest(query="What database does Retrieva AI use?", conversation_id=c.id),
+                owner_id=TEST_CONV_OWNER_ID,
+                conversation_service=conv_service,
+            )
 
             # Chunks passed into build_context must strictly be retrieved chunks from the retriever
             chunks_passed = spy_builder.call_args[0][0]
@@ -580,13 +722,14 @@ class TestConversationalQueryRewriter:
 class TestConversationRAGIntegration:
     """Test suite for multi-turn RAG execution, query persistence, citation safety, and cancellation."""
 
-    def test_conversation_aware_answer_uses_rewritten_query(self, rag_with_conv_fixture):
+    @pytest.mark.asyncio
+    async def test_conversation_aware_answer_uses_rewritten_query(self, rag_with_conv_fixture):
         """21. Verify conversation-aware answering rewrites query and searches document index."""
         rag_service, mock_llm, conv_service, _ = rag_with_conv_fixture
-        c = conv_service.create_conversation(title="Multi-turn RAG")
+        c = await conv_service.create_conversation(owner_id=TEST_CONV_OWNER_ID, title="Multi-turn RAG")
 
         # Mock query rewriter on the service
-        conv_service.query_rewriter.rewrite = MagicMock(return_value="What database does Retrieva AI utilize?")
+        conv_service.query_rewriter.rewrite_async = AsyncMock(return_value="What database does Retrieva AI utilize?")
 
         mock_llm.generate.return_value = {
             "content": json.dumps({
@@ -597,60 +740,63 @@ class TestConversationRAGIntegration:
         }
 
         # Seed turn 1
-        conv_service.record_user_message(c.id, "What is Retrieva AI?", "What is Retrieva AI?")
-        conv_service.record_assistant_message(c.id, "Retrieva AI is a document QA system.")
+        await conv_service.record_user_message(c.id, TEST_CONV_OWNER_ID, "What is Retrieva AI?", "What is Retrieva AI?")
+        await conv_service.record_assistant_message(c.id, TEST_CONV_OWNER_ID, "Retrieva AI is a document QA system.")
 
-        with patch("backend.app.conversations.service.get_conversation_service", return_value=conv_service):
-            response = rag_service.answer_question(
-                AnswerRequest(query="What database does it use?", conversation_id=c.id)
-            )
+        response = await rag_service.answer_question_async(
+            AnswerRequest(query="What database does it use?", conversation_id=c.id),
+            owner_id=TEST_CONV_OWNER_ID,
+            conversation_service=conv_service,
+        )
 
         assert response.conversation_id == c.id
         assert response.query == "What database does it use?"
         assert response.rewritten_query == "What database does Retrieva AI utilize?"
         assert len(response.citations) >= 1
 
-    def test_raw_and_rewritten_queries_persisted_separately(self, rag_with_conv_fixture):
-        """22 & 23. Verify raw_query and rewritten_query are stored distinctly in the database."""
-        rag_service, mock_llm, conv_service, repo = rag_with_conv_fixture
-        c = conv_service.create_conversation(title="Query Separation")
+    @pytest.mark.asyncio
+    async def test_raw_and_rewritten_queries_persisted_separately(self, rag_with_conv_fixture):
+        """22 & 23. Verify raw_query and rewritten_query are stored distinctly in Supabase."""
+        rag_service, mock_llm, conv_service, msg_repo = rag_with_conv_fixture
+        c = await conv_service.create_conversation(owner_id=TEST_CONV_OWNER_ID, title="Query Separation")
 
-        conv_service.query_rewriter.rewrite = MagicMock(return_value="Rewritten Standalone Query")
+        conv_service.query_rewriter.rewrite_async = AsyncMock(return_value="Rewritten Standalone Query")
         mock_llm.generate.return_value = {
             "content": json.dumps({"answer": "Answer [Source 1]", "citations": [{"source_id": "[Source 1]"}]}),
             "model": "gpt-4o-mini",
         }
 
         # Seed turn 1 so turn 2 triggers rewrite
-        conv_service.record_user_message(c.id, "T1", "T1")
-        conv_service.record_assistant_message(c.id, "A1")
+        await conv_service.record_user_message(c.id, TEST_CONV_OWNER_ID, "T1", "T1")
+        await conv_service.record_assistant_message(c.id, TEST_CONV_OWNER_ID, "A1")
 
-        with patch("backend.app.conversations.service.get_conversation_service", return_value=conv_service):
-            rag_service.answer_question(
-                AnswerRequest(query="Original Raw Query", conversation_id=c.id)
-            )
+        await rag_service.answer_question_async(
+            AnswerRequest(query="Original Raw Query", conversation_id=c.id),
+            owner_id=TEST_CONV_OWNER_ID,
+            conversation_service=conv_service,
+        )
 
-        messages = repo.get_messages(c.id)
-        # Look at the latest user message
+        messages = await msg_repo.list_messages(UUID(c.id), owner_id=TEST_CONV_OWNER_ID)
         user_msgs = [m for m in messages if m.role == "user" and m.content == "Original Raw Query"]
         assert len(user_msgs) == 1
         assert user_msgs[0].raw_query == "Original Raw Query"
         assert user_msgs[0].rewritten_query == "Rewritten Standalone Query"
 
-    def test_different_conversations_remain_isolated(self, rag_with_conv_fixture):
+    @pytest.mark.asyncio
+    async def test_different_conversations_remain_isolated(self, rag_with_conv_fixture):
         """24. Verify conversation messages never cross-contaminate between different session IDs."""
-        _, _, conv_service, repo = rag_with_conv_fixture
-        c1 = conv_service.create_conversation(title="Chat 1")
-        c2 = conv_service.create_conversation(title="Chat 2")
+        _, _, conv_service, msg_repo = rag_with_conv_fixture
+        c1 = await conv_service.create_conversation(owner_id=TEST_CONV_OWNER_ID, title="Chat 1")
+        c2 = await conv_service.create_conversation(owner_id=TEST_CONV_OWNER_ID, title="Chat 2")
 
-        conv_service.record_user_message(c1.id, "Secret of Chat 1", "Secret of Chat 1")
-        conv_service.record_assistant_message(c1.id, "Answer for Chat 1")
+        await conv_service.record_user_message(c1.id, TEST_CONV_OWNER_ID, "Secret of Chat 1", "Secret of Chat 1")
+        await conv_service.record_assistant_message(c1.id, TEST_CONV_OWNER_ID, "Answer for Chat 1")
 
-        conv_service.record_user_message(c2.id, "Query for Chat 2", "Query for Chat 2")
-        conv_service.record_assistant_message(c2.id, "Answer for Chat 2")
+        await conv_service.record_user_message(c2.id, TEST_CONV_OWNER_ID, "Query for Chat 2", "Query for Chat 2")
+        await conv_service.record_assistant_message(c2.id, TEST_CONV_OWNER_ID, "Answer for Chat 2")
 
-        msgs_c1 = repo.get_messages(c1.id)
-        msgs_c2 = repo.get_messages(c2.id)
+        msgs_c1 = await msg_repo.list_messages(UUID(c1.id), owner_id=TEST_CONV_OWNER_ID)
+        msgs_c2 = await msg_repo.list_messages(UUID(c2.id), owner_id=TEST_CONV_OWNER_ID)
 
         assert len(msgs_c1) == 2
         assert len(msgs_c2) == 2
@@ -665,7 +811,10 @@ class TestConversationRAGIntegration:
             "model": "gpt-4o-mini",
         }
 
-        response = rag_service.answer_question(AnswerRequest(query="What is Retrieva AI?"))
+        response = rag_service.answer_question(
+            AnswerRequest(query="What is Retrieva AI?"),
+            owner_id=TEST_CONV_OWNER_ID,
+        )
         assert response.conversation_id is None
         assert response.rewritten_query is None
         assert "Non-conversational answer" in response.answer
@@ -682,17 +831,21 @@ class TestConversationRAGIntegration:
         mock_llm.generate_stream_async = MagicMock(side_effect=fake_stream)
 
         events = []
-        async for ev in rag_service.answer_question_stream(AnswerRequest(query="What is Retrieva AI?")):
+        async for ev in rag_service.answer_question_stream(
+            AnswerRequest(query="What is Retrieva AI?"),
+            owner_id=TEST_CONV_OWNER_ID,
+        ):
             events.append(ev)
 
         assert any("event: token" in ev for ev in events)
         assert any("event: citations" in ev for ev in events)
         assert any("event: done" in ev for ev in events)
 
-    def test_rejected_answers_not_stored_as_verified_content(self, rag_with_conv_fixture):
-        """27. Verify that answers with fabricated citations store safe rejection fallback, not hallucinated text."""
-        rag_service, mock_llm, conv_service, repo = rag_with_conv_fixture
-        c = conv_service.create_conversation(title="Rejection Persistence Guard")
+    @pytest.mark.asyncio
+    async def test_rejected_answers_not_stored_as_verified_content(self, rag_with_conv_fixture):
+        """27. Verify that answers with fabricated citations prevent assistant-message persistence while returning safe rejection."""
+        rag_service, mock_llm, conv_service, msg_repo = rag_with_conv_fixture
+        c = await conv_service.create_conversation(owner_id=TEST_CONV_OWNER_ID, title="Rejection Persistence Guard")
 
         # LLM attempts to hallucinate [Source 99]
         mock_llm.generate.return_value = {
@@ -703,50 +856,51 @@ class TestConversationRAGIntegration:
             "model": "gpt-4o-mini",
         }
 
-        with patch("backend.app.conversations.service.get_conversation_service", return_value=conv_service):
-            rag_service.answer_question(AnswerRequest(query="What is fake?", conversation_id=c.id))
+        resp = await rag_service.answer_question_async(
+            AnswerRequest(query="What is fake?", conversation_id=c.id),
+            owner_id=TEST_CONV_OWNER_ID,
+            conversation_service=conv_service,
+        )
 
-        messages = repo.get_messages(c.id)
+        assert resp.metadata.has_hallucinated_sources is True
+        assert "could not be verified" in resp.answer
+
+        messages = await msg_repo.list_messages(UUID(c.id), owner_id=TEST_CONV_OWNER_ID)
         assistant_msgs = [m for m in messages if m.role == "assistant"]
-        assert len(assistant_msgs) == 1
-        assert "Fabricated claim citing" not in assistant_msgs[0].content
-        assert "could not be verified" in assistant_msgs[0].content
-        assert assistant_msgs[0].metadata.get("rejected") is True
+        assert len(assistant_msgs) == 0
 
     @pytest.mark.asyncio
     async def test_cancellation_does_not_persist_partial_assistant_answer(self, rag_with_conv_fixture):
         """28. Verify client disconnect/cancellation during streaming does NOT persist unverified partial tokens."""
-        rag_service, mock_llm, conv_service, repo = rag_with_conv_fixture
-        c = conv_service.create_conversation(title="Cancellation Guard")
+        rag_service, mock_llm, conv_service, msg_repo = rag_with_conv_fixture
+        c = await conv_service.create_conversation(owner_id=TEST_CONV_OWNER_ID, title="Cancellation Guard")
 
         async def cancellable_stream(*args, **kwargs):
             yield "Partial token delta "
-            import asyncio
             await asyncio.sleep(0.5)
             yield "never reached"
 
         mock_llm.generate_stream_async = MagicMock(side_effect=cancellable_stream)
 
-        with patch("backend.app.conversations.service.get_conversation_service", return_value=conv_service):
-            gen = rag_service.answer_question_stream(
-                AnswerRequest(query="Stream cancellation test", conversation_id=c.id)
-            )
-            # Read until first token arrives
-            async for ev in gen:
-                if "event: token" in ev:
-                    break
-            # Disconnect / cancel
-            await gen.aclose()
+        gen = rag_service.answer_question_stream(
+            AnswerRequest(query="Stream cancellation test", conversation_id=c.id),
+            owner_id=TEST_CONV_OWNER_ID,
+            conversation_service=conv_service,
+        )
+        async for ev in gen:
+            if "event: token" in ev:
+                break
+        await gen.aclose()
 
-        # Check database: user message may exist, but NO assistant message must be persisted
-        messages = repo.get_messages(c.id)
+        messages = await msg_repo.list_messages(UUID(c.id), owner_id=TEST_CONV_OWNER_ID)
         assistant_msgs = [m for m in messages if m.role == "assistant"]
         assert len(assistant_msgs) == 0, "Partial unverified assistant output was improperly persisted upon cancellation!"
 
-    def test_citation_metadata_persists_and_reloads(self, rag_with_conv_fixture):
-        """29. Verify verified citations and metadata persist in JSON and reload accurately."""
-        rag_service, mock_llm, conv_service, repo = rag_with_conv_fixture
-        c = conv_service.create_conversation(title="Citation Metadata")
+    @pytest.mark.asyncio
+    async def test_citation_metadata_persists_and_reloads(self, rag_with_conv_fixture):
+        """29. Verify verified citations and metadata persist and reload accurately."""
+        rag_service, mock_llm, conv_service, msg_repo = rag_with_conv_fixture
+        c = await conv_service.create_conversation(owner_id=TEST_CONV_OWNER_ID, title="Citation Metadata")
 
         mock_llm.generate.return_value = {
             "content": json.dumps({
@@ -756,30 +910,42 @@ class TestConversationRAGIntegration:
             "model": "gpt-4o-mini",
         }
 
-        with patch("backend.app.conversations.service.get_conversation_service", return_value=conv_service):
-            rag_service.answer_question(AnswerRequest(query="Tell me about Retrieva AI", conversation_id=c.id))
+        await rag_service.answer_question_async(
+            AnswerRequest(query="Tell me about Retrieva AI", conversation_id=c.id),
+            owner_id=TEST_CONV_OWNER_ID,
+            conversation_service=conv_service,
+        )
 
-        messages = repo.get_messages(c.id)
+        messages = await msg_repo.list_messages(UUID(c.id), owner_id=TEST_CONV_OWNER_ID)
         assistant_msg = [m for m in messages if m.role == "assistant"][0]
         assert assistant_msg.metadata is not None
         assert "citations" in assistant_msg.metadata
         assert len(assistant_msg.metadata["citations"]) >= 1
+        assert len(assistant_msg.citations) >= 1
 
-    def test_repeated_request_handling_safe(self, rag_with_conv_fixture):
+    @pytest.mark.asyncio
+    async def test_repeated_request_handling_safe(self, rag_with_conv_fixture):
         """30. Verify repeated questions within the same conversation do not corrupt storage."""
-        rag_service, mock_llm, conv_service, repo = rag_with_conv_fixture
-        c = conv_service.create_conversation(title="Repeated Turns")
+        rag_service, mock_llm, conv_service, msg_repo = rag_with_conv_fixture
+        c = await conv_service.create_conversation(owner_id=TEST_CONV_OWNER_ID, title="Repeated Turns")
 
         mock_llm.generate.return_value = {
             "content": json.dumps({"answer": "Answer 1 [Source 1].", "citations": [{"source_id": "[Source 1]"}]}),
             "model": "gpt-4o-mini",
         }
 
-        with patch("backend.app.conversations.service.get_conversation_service", return_value=conv_service):
-            rag_service.answer_question(AnswerRequest(query="Question 1", conversation_id=c.id))
-            rag_service.answer_question(AnswerRequest(query="Question 1", conversation_id=c.id))
+        await rag_service.answer_question_async(
+            AnswerRequest(query="Question 1", conversation_id=c.id),
+            owner_id=TEST_CONV_OWNER_ID,
+            conversation_service=conv_service,
+        )
+        await rag_service.answer_question_async(
+            AnswerRequest(query="Question 1", conversation_id=c.id),
+            owner_id=TEST_CONV_OWNER_ID,
+            conversation_service=conv_service,
+        )
 
-        messages = repo.get_messages(c.id)
+        messages = await msg_repo.list_messages(UUID(c.id), owner_id=TEST_CONV_OWNER_ID)
         assert len(messages) == 4  # 2 user + 2 assistant
 
 
@@ -787,14 +953,23 @@ class TestConversationRESTAPIEndpoints:
     """Test suite for Conversation HTTP REST endpoints via Starlette TestClient."""
 
     @pytest.fixture
-    def api_client(self, temp_conv_db: str):
-        """Create a TestClient with dependency overrides for isolated conversation DB."""
-        repo = ConversationRepository(db_path=temp_conv_db)
-        service = ConversationService(repository=repo)
+    def api_client(self):
+        """Create a TestClient with dependency overrides for Supabase-backed ConversationService."""
+        mock_llm = MagicMock(spec=OpenAIClient)
+        mock_llm.api_key = "sk-test-key"
+        mock_llm.model = "gpt-4o-mini"
+        rewriter = ConversationalQueryRewriter(llm_client=mock_llm)
+        service, _, _ = _build_supabase_conv_service(rewriter)
+
+        prev_service = app.dependency_overrides.get(get_conversation_service)
         app.dependency_overrides[get_conversation_service] = lambda: service
-        app.dependency_overrides[get_conversation_repository] = lambda: repo
-        yield TestClient(app)
-        app.dependency_overrides.clear()
+        try:
+            yield TestClient(app)
+        finally:
+            if prev_service is None:
+                app.dependency_overrides.pop(get_conversation_service, None)
+            else:
+                app.dependency_overrides[get_conversation_service] = prev_service
 
     def test_post_conversations_create(self, api_client: TestClient):
         """31. Verify POST /api/v1/conversations creates a conversation."""
@@ -843,10 +1018,11 @@ class TestConversationRESTAPIEndpoints:
 
         assert api_client.get(f"/api/v1/conversations/{cid}").status_code == 404
 
-    def test_conversation_answer_json_endpoint(self, api_client: TestClient, rag_with_conv_fixture):
+    @pytest.mark.asyncio
+    async def test_conversation_answer_json_endpoint(self, api_client: TestClient, rag_with_conv_fixture):
         """35. Verify POST /api/v1/conversations/{id}/answer generates grounded answer."""
         rag_service, mock_llm, conv_service, _ = rag_with_conv_fixture
-        c = conv_service.create_conversation(title="Endpoint Answer")
+        c = await conv_service.create_conversation(owner_id=TEST_CONV_OWNER_ID, title="Endpoint Answer")
 
         mock_llm.generate.return_value = {
             "content": json.dumps({"answer": "Endpoint response [Source 1].", "citations": [{"source_id": "[Source 1]"}]}),
@@ -867,10 +1043,11 @@ class TestConversationRESTAPIEndpoints:
         finally:
             app.dependency_overrides.pop(get_rag_service, None)
 
-    def test_conversation_answer_stream_endpoint(self, api_client: TestClient, rag_with_conv_fixture):
+    @pytest.mark.asyncio
+    async def test_conversation_answer_stream_endpoint(self, api_client: TestClient, rag_with_conv_fixture):
         """36. Verify POST /api/v1/conversations/{id}/answer/stream streams SSE frames."""
         rag_service, mock_llm, conv_service, _ = rag_with_conv_fixture
-        c = conv_service.create_conversation(title="Endpoint Stream")
+        c = await conv_service.create_conversation(owner_id=TEST_CONV_OWNER_ID, title="Endpoint Stream")
 
         async def fake_stream(*args, **kwargs):
             yield "SSE token stream [Source 1]."
@@ -895,21 +1072,20 @@ class TestConversationRESTAPIEndpoints:
 
 
 class TestAsyncDatabaseAndConcurrency:
-    """Verification suite for asyncio event-loop non-blocking DB offloading,
+    """Verification suite for async DB non-blocking execution,
     same-conversation turn serialization, and cross-conversation isolation.
     """
 
     @pytest.mark.asyncio
     async def test_async_database_responsiveness_slow_operation_does_not_block_event_loop(self, conv_service: ConversationService):
-        """Verify that a slow database query offloaded to worker thread does not starve asyncio event loop tasks."""
-        # Wrap list_conversations with a deliberate 0.15s sleep in the worker thread
-        orig_list = conv_service.repository.list_conversations
+        """Verify that a slow Supabase request does not starve concurrent asyncio event loop tasks."""
+        orig_list = conv_service.conversation_repo.list_conversations
 
-        def slow_list(*args, **kwargs):
-            time.sleep(0.15)
-            return orig_list(*args, **kwargs)
+        async def slow_list(*args, **kwargs):
+            await asyncio.sleep(0.15)
+            return await orig_list(*args, **kwargs)
 
-        conv_service.repository.list_conversations = slow_list
+        conv_service.conversation_repo.list_conversations = slow_list
 
         ticker_times = []
 
@@ -918,20 +1094,17 @@ class TestAsyncDatabaseAndConcurrency:
                 await asyncio.sleep(0.02)
                 ticker_times.append(time.time())
 
-        # Launch slow DB operation and fast ticker concurrently
-        db_task = asyncio.create_task(conv_service.list_conversations_async())
+        db_task = asyncio.create_task(conv_service.list_conversations(owner_id=TEST_CONV_OWNER_ID))
         ticker_task = asyncio.create_task(ticker())
 
         await asyncio.gather(db_task, ticker_task)
-
-        # The ticker should have ticked multiple times while the slow DB query was executing
         assert len(ticker_times) >= 4, f"Event loop was starved! Only {len(ticker_times)} ticks recorded."
 
     @pytest.mark.asyncio
     async def test_same_conversation_simultaneous_turns_serialized(self, rag_with_conv_fixture):
         """Verify simultaneous streaming requests to the same conversation are strictly serialized FIFO."""
-        rag_service, mock_llm, conv_service, _ = rag_with_conv_fixture
-        c = conv_service.create_conversation(title="Serialized Session")
+        rag_service, mock_llm, conv_service, msg_repo = rag_with_conv_fixture
+        c = await conv_service.create_conversation(owner_id=TEST_CONV_OWNER_ID, title="Serialized Session")
 
         turn1_started = False
         turn1_finished = False
@@ -940,7 +1113,7 @@ class TestAsyncDatabaseAndConcurrency:
         async def fake_stream_turn1(*args, **kwargs):
             nonlocal turn1_started, turn1_finished
             turn1_started = True
-            await asyncio.sleep(0.08)  # Simulate generation duration
+            await asyncio.sleep(0.08)
             turn1_finished = True
             yield "Turn 1 answer [Source 1]."
 
@@ -949,7 +1122,6 @@ class TestAsyncDatabaseAndConcurrency:
             turn2_saw_turn1_finished = turn1_finished
             yield "Turn 2 answer [Source 1]."
 
-        # When turn 1 runs, mock_llm returns fake_stream_turn1, then fake_stream_turn2
         streams = [fake_stream_turn1, fake_stream_turn2]
 
         def get_stream(*args, **kwargs):
@@ -963,17 +1135,19 @@ class TestAsyncDatabaseAndConcurrency:
 
         async def consume_stream(req):
             tokens = []
-            async for frame in rag_service.answer_question_stream(req):
+            async for frame in rag_service.answer_question_stream(
+                req,
+                owner_id=TEST_CONV_OWNER_ID,
+                conversation_service=conv_service,
+            ):
                 tokens.append(frame)
             return tokens
 
-        # Launch both simultaneously targeting the same conversation
-        t1, t2 = await asyncio.gather(consume_stream(req1), consume_stream(req2))
+        await asyncio.gather(consume_stream(req1), consume_stream(req2))
 
         assert turn2_saw_turn1_finished is True, "Turn 2 executed concurrently with Turn 1 instead of waiting for lock!"
 
-        # Verify messages in SQLite
-        messages = conv_service.repository.get_messages(c.id)
+        messages = await msg_repo.list_messages(UUID(c.id), owner_id=TEST_CONV_OWNER_ID)
         assert len(messages) == 4
         assert messages[0].role == "user" and messages[0].content == "Question 1"
         assert messages[1].role == "assistant" and "Turn 1 answer" in messages[1].content
@@ -984,8 +1158,8 @@ class TestAsyncDatabaseAndConcurrency:
     async def test_different_conversations_execute_concurrently(self, rag_with_conv_fixture):
         """Verify requests to different conversations proceed concurrently without waiting on each other."""
         rag_service, mock_llm, conv_service, _ = rag_with_conv_fixture
-        c1 = conv_service.create_conversation(title="Session 1")
-        c2 = conv_service.create_conversation(title="Session 2")
+        c1 = await conv_service.create_conversation(owner_id=TEST_CONV_OWNER_ID, title="Session 1")
+        c2 = await conv_service.create_conversation(owner_id=TEST_CONV_OWNER_ID, title="Session 2")
 
         execution_log = []
 
@@ -1002,7 +1176,6 @@ class TestAsyncDatabaseAndConcurrency:
             yield "C2 answer [Source 1]."
 
         def stream_router(*args, **kwargs):
-            # Check prompt content to route to corresponding stream
             msgs = kwargs.get("messages") or (args[0] if args else [])
             user_msg = msgs[-1]["content"] if msgs else ""
             if "Query C1" in user_msg:
@@ -1015,7 +1188,11 @@ class TestAsyncDatabaseAndConcurrency:
         req2 = AnswerRequest(query="Query C2", conversation_id=c2.id)
 
         async def consume(req):
-            async for _ in rag_service.answer_question_stream(req):
+            async for _ in rag_service.answer_question_stream(
+                req,
+                owner_id=TEST_CONV_OWNER_ID,
+                conversation_service=conv_service,
+            ):
                 pass
 
         await asyncio.gather(consume(req1), consume(req2))

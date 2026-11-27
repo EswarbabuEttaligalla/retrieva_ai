@@ -32,6 +32,7 @@ env/
 *.env
 !.env.example
 !backend/.env.example
+!frontend/.env.example
 
 # Testing & Coverage
 .pytest_cache/
@@ -46,9 +47,14 @@ frontend/dist-ssr/
 frontend/*.local
 .eslintcache
 
-# Vector Database (Chroma data)
+# Vector Database (Chroma data) & Backups
 chroma_data/
 *.chroma
+backups/
+
+# Supabase CLI generated local state
+supabase/.temp/
+supabase/.branches/
 
 # IDE & OS Files
 .vscode/

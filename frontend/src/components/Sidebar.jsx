@@ -15,7 +15,11 @@ import {
   Info,
   Plus,
   MessageSquare,
-  MessagesSquare
+  MessagesSquare,
+  LogOut,
+  Pencil,
+  Check,
+  X
 } from 'lucide-react';
 
 /**
@@ -62,6 +66,9 @@ export default function Sidebar({
   onSelectConversation = () => {},
   onNewChat = () => {},
   onDeleteConversation = () => {},
+  onRenameConversation = null,
+  userEmail = null,
+  onSignOut = null,
 }) {
   const [dragActive, setDragActive] = useState(false);
   const [uploadMessage, setUploadMessage] = useState(null);
@@ -70,6 +77,9 @@ export default function Sidebar({
   const [deletingId, setDeletingId] = useState(null);
   const [confirmDeleteConvId, setConfirmDeleteConvId] = useState(null);
   const [deletingConvId, setDeletingConvId] = useState(null);
+  const [editingConvId, setEditingConvId] = useState(null);
+  const [editingConvTitle, setEditingConvTitle] = useState('');
+  const [renamingConvId, setRenamingConvId] = useState(null);
   const fileInputRef = useRef(null);
 
   // Drag & drop handlers
@@ -177,6 +187,37 @@ export default function Sidebar({
     setConfirmDeleteConvId(null);
   };
 
+  const handleStartRenameConv = (e, conv) => {
+    e.stopPropagation();
+    setConfirmDeleteConvId(null);
+    setEditingConvId(conv.id);
+    setEditingConvTitle(conv.title || '');
+  };
+
+  const handleSaveRenameConv = async (e, convId) => {
+    e.stopPropagation();
+    const clean = editingConvTitle.trim();
+    if (!clean || !onRenameConversation) {
+      setEditingConvId(null);
+      return;
+    }
+    setRenamingConvId(convId);
+    try {
+      await onRenameConversation(convId, clean);
+      setEditingConvId(null);
+    } catch (err) {
+      setUploadError(err.message || 'Failed to rename conversation.');
+    } finally {
+      setRenamingConvId(null);
+    }
+  };
+
+  const handleCancelRenameConv = (e) => {
+    e.stopPropagation();
+    setEditingConvId(null);
+    setEditingConvTitle('');
+  };
+
   const totalChunksCount = documents.reduce((acc, doc) => acc + (doc.total_chunks || 0), 0);
 
   return (
@@ -277,6 +318,36 @@ export default function Sidebar({
                           </button>
                         </div>
                       </div>
+                    ) : editingConvId === conv.id ? (
+                      <div className="flex items-center w-full space-x-1" onClick={(e) => e.stopPropagation()}>
+                        <input
+                          type="text"
+                          value={editingConvTitle}
+                          onChange={(e) => setEditingConvTitle(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') handleSaveRenameConv(e, conv.id);
+                            if (e.key === 'Escape') handleCancelRenameConv(e);
+                          }}
+                          aria-label="Rename conversation title"
+                          className="flex-1 min-w-0 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-[11px] text-white focus:outline-none focus:border-brand-500"
+                          autoFocus
+                        />
+                        <button
+                          onClick={(e) => handleSaveRenameConv(e, conv.id)}
+                          disabled={renamingConvId === conv.id}
+                          className="p-1 rounded text-emerald-400 hover:bg-slate-800"
+                          title="Save title"
+                        >
+                          <Check className="w-3 h-3" />
+                        </button>
+                        <button
+                          onClick={handleCancelRenameConv}
+                          className="p-1 rounded text-slate-400 hover:bg-slate-800"
+                          title="Cancel rename"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </div>
                     ) : (
                       <>
                         <div className="flex items-center space-x-2 min-w-0 flex-1">
@@ -290,6 +361,16 @@ export default function Sidebar({
                             <span className="px-1.5 py-0.2 rounded-full text-[9px] bg-slate-800 text-slate-400 font-mono">
                               {conv.message_count}
                             </span>
+                          )}
+                          {onRenameConversation && (
+                            <button
+                              onClick={(e) => handleStartRenameConv(e, conv)}
+                              className="opacity-0 group-hover:opacity-100 p-1 rounded text-slate-500 hover:text-brand-300 hover:bg-slate-800 transition"
+                              title="Rename conversation"
+                              aria-label="Rename conversation"
+                            >
+                              <Pencil className="w-3 h-3" />
+                            </button>
                           )}
                           <button
                             onClick={(e) => handleDeleteConvClick(e, conv.id)}
@@ -510,6 +591,21 @@ export default function Sidebar({
 
                         {/* Action buttons */}
                         <div className="flex items-center space-x-1 shrink-0">
+                          {onToggleDocSelection && (
+                            <button
+                              type="button"
+                              onClick={() => onToggleDocSelection(doc.document_id)}
+                              className={`px-1.5 py-0.5 rounded text-[10px] font-medium border transition ${
+                                selectedDocIds.includes(doc.document_id)
+                                  ? 'bg-brand-600/20 border-brand-500/40 text-brand-300'
+                                  : 'bg-slate-900 border-slate-800 text-slate-500 hover:text-slate-300'
+                              }`}
+                              title="Toggle document scope filter"
+                              aria-label={`Filter by ${doc.filename}`}
+                            >
+                              {selectedDocIds.includes(doc.document_id) ? 'Scoped' : 'Filter'}
+                            </button>
+                          )}
                           <button
                             onClick={() => handleDeleteClick(doc.document_id)}
                             className="p-1 rounded text-slate-500 hover:text-rose-400 hover:bg-slate-800/80 transition"
@@ -528,13 +624,38 @@ export default function Sidebar({
         </div>
       </div>
 
-      {/* Footer System Info */}
-      <div className="p-3 border-t border-slate-800/80 bg-slate-900/60 text-[11px] text-slate-500 flex items-center justify-between">
-        <div className="flex items-center space-x-1.5">
-          <Layers className="w-3.5 h-3.5 text-slate-400" />
-          <span>ChromaDB Vector Store</span>
+      {/* Footer System & Authenticated Account Bar */}
+      <div className="border-t border-slate-800/80 bg-slate-900/60">
+        {(userEmail || onSignOut) && (
+          <div className="px-3 py-2.5 border-b border-slate-800/70 flex items-center justify-between space-x-2">
+            <div className="min-w-0 flex-1">
+              <p className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">
+                Signed in as
+              </p>
+              <p className="text-xs text-slate-200 font-medium truncate" title={userEmail || ''}>
+                {userEmail || 'Authenticated User'}
+              </p>
+            </div>
+            {onSignOut && (
+              <button
+                type="button"
+                onClick={onSignOut}
+                className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-200 flex items-center space-x-1.5 transition shrink-0"
+                title="Sign out of your account"
+              >
+                <LogOut className="w-3.5 h-3.5 text-slate-400" />
+                <span>Sign Out</span>
+              </button>
+            )}
+          </div>
+        )}
+        <div className="p-3 text-[11px] text-slate-500 flex items-center justify-between">
+          <div className="flex items-center space-x-1.5">
+            <Layers className="w-3.5 h-3.5 text-slate-400" />
+            <span>ChromaDB Vector Store</span>
+          </div>
+          <span>all-MiniLM-L6-v2</span>
         </div>
-        <span>all-MiniLM-L6-v2</span>
       </div>
     </aside>
   );

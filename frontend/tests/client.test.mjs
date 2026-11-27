@@ -1,7 +1,8 @@
-import { test, describe } from 'node:test';
+import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { 
   ApiError, 
+  configureAuthClient,
   askQuestion, 
   askQuestionStream, 
   uploadDocument, 
@@ -10,10 +11,20 @@ import {
   createConversation,
   fetchConversations,
   fetchConversation,
+  updateConversationTitle,
   deleteConversation,
 } from '../src/api/client.js';
 
 describe('Frontend API Client Suite', () => {
+  beforeEach(() => {
+    configureAuthClient({
+      getAccessToken: async () => 'test-supabase-jwt-token',
+    });
+  });
+
+  afterEach(() => {
+    configureAuthClient(null);
+  });
   test('ApiError instantiates correctly with status and detail', () => {
     const err = new ApiError('Not found', 404, 'Document doc_123 does not exist');
     assert.equal(err.name, 'ApiError');
@@ -490,12 +501,16 @@ describe('Frontend API Client Suite', () => {
         conversation_id: 'conv_xyz',
       });
       assert.equal(jsonBody.conversation_id, 'conv_xyz');
+      assert.equal(jsonBody.retrieval_config.top_k, 7);
+      assert.equal(jsonBody.retrieval_config.similarity_threshold, null);
 
       await askQuestionStream({
         query: 'Testing conv stream forwarding',
         conversation_id: 'conv_xyz_stream',
       });
       assert.equal(streamBody.conversation_id, 'conv_xyz_stream');
+      assert.equal(streamBody.retrieval_config.top_k, 7);
+      assert.equal(streamBody.retrieval_config.similarity_threshold, null);
     } finally {
       globalThis.fetch = originalFetch;
     }

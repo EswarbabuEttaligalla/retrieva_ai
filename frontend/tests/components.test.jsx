@@ -1,8 +1,9 @@
-import test, { describe, it } from 'node:test';
+import test, { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import './setup.mjs';
 import React from 'react';
 import { render, screen, fireEvent, act, cleanup } from '@testing-library/react';
+import { configureAuthClient } from '../src/api/client.js';
 
 import Sidebar from '../src/components/Sidebar.jsx';
 import ChatWorkspace from '../src/components/ChatWorkspace.jsx';
@@ -18,6 +19,15 @@ function resetDom() {
 }
 
 describe('Frontend Component Verification Suite', () => {
+  beforeEach(() => {
+    configureAuthClient({
+      getAccessToken: async () => 'test-component-jwt',
+    });
+  });
+
+  afterEach(() => {
+    configureAuthClient(null);
+  });
 
   // 1. Document list rendering
   it('1. renders document list with filenames, chunk counts, and page indicators', () => {

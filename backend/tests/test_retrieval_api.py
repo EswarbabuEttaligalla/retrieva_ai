@@ -53,7 +53,6 @@ def test_retrieval_fixture(shared_embedder) -> Generator[Retriever, None, None]:
         collection_name="test_api_retrieval",
         persist_directory=temp_dir,
     )
-    bm25 = BM25Index()
 
     # Create two distinct test documents
     doc1_chunk = DocumentChunk(
@@ -88,35 +87,29 @@ def test_retrieval_fixture(shared_embedder) -> Generator[Retriever, None, None]:
     texts = [c.chunk_text for c in chunks]
     embeddings = shared_embedder.embed_batch(texts)
 
-    store.add_chunks(chunks, embeddings, prevent_duplicates=False)
-    for c in chunks:
-        bm25.add_chunk({
-            "chunk_id": c.chunk_id,
-            "document_id": c.document_id,
-            "filename": c.filename,
-            "chunk_text": c.chunk_text,
-            "page_number": c.page_number,
-            "page_references": c.page_references,
-            "start_offset": c.start_offset,
-            "end_offset": c.end_offset,
-        })
+    from uuid import UUID
+    test_owner_id = UUID("11111111-1111-4111-8111-111111111111")
+    store.add_chunks(chunks, embeddings, owner_id=test_owner_id, prevent_duplicates=False)
 
     retriever = Retriever(
         dense_retriever=DenseRetriever(embedder=shared_embedder, vector_store=store),
-        bm25_index=bm25,
         vector_store=store,
         reranker=CrossEncoderReranker.get_instance(),
-        auto_sync_bm25=False,
     )
 
     # Override get_retriever in app
+    prev_retriever = app.dependency_overrides.get(get_retriever)
     app.dependency_overrides[get_retriever] = lambda: retriever
 
-    yield retriever
-
-    # Teardown
-    app.dependency_overrides.clear()
-    shutil.rmtree(temp_dir, ignore_errors=True)
+    try:
+        yield retriever
+    finally:
+        # Teardown only the override owned by this fixture
+        if prev_retriever is None:
+            app.dependency_overrides.pop(get_retriever, None)
+        else:
+            app.dependency_overrides[get_retriever] = prev_retriever
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 class TestRetrievalAPIEndpoints:
@@ -354,7 +347,11 @@ class TestRetrievalAPIEndpoints:
                 enable_reranking=True,
             ),
         )
-        direct_result = test_retrieval_fixture.retrieve(req)
+        from uuid import UUID
+        direct_result = test_retrieval_fixture.retrieve(
+            req,
+            owner_id=UUID("11111111-1111-4111-8111-111111111111"),
+        )
 
         # Call via API endpoint with identical parameters
         payload = {

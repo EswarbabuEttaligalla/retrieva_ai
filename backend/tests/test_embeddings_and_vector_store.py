@@ -202,6 +202,11 @@ class TestSentenceTransformerEmbedder:
 # 3. Persistent ChromaDB Vector Store Tests
 # ============================================================================
 
+from uuid import UUID
+
+TEST_OWNER_ID = UUID("11111111-1111-4111-8111-111111111111")
+
+
 class TestChromaVectorStore:
     """Test suite for ChromaVectorStore persistence, metadata, and operations."""
 
@@ -257,11 +262,11 @@ class TestChromaVectorStore:
         norm_val = 1.0 / math.sqrt(384)
         embeddings = [[norm_val] * 384, [norm_val] * 384]
 
-        count = store.add_chunks(chunks, embeddings, content_hash="hash_123")
+        count = store.add_chunks(chunks, embeddings, owner_id=TEST_OWNER_ID, content_hash="hash_123")
         assert count == 2
         assert store.count() == 2
-        assert store.has_document(doc_id) is True
-        assert store.has_content_hash("hash_123") is True
+        assert store.has_document(doc_id, owner_id=TEST_OWNER_ID) is True
+        assert store.has_content_hash("hash_123", owner_id=TEST_OWNER_ID) is True
 
     def test_metadata_serialization_and_deserialization(self, temp_store):
         store, _ = temp_store
@@ -280,9 +285,9 @@ class TestChromaVectorStore:
             word_count=7,
         )
         norm_val = 1.0 / math.sqrt(384)
-        store.add_chunks([chunk], [[norm_val] * 384], content_hash="hash_multi")
+        store.add_chunks([chunk], [[norm_val] * 384], owner_id=TEST_OWNER_ID, content_hash="hash_multi")
 
-        retrieved_chunks = store.get_document_chunks(doc_id)
+        retrieved_chunks = store.get_document_chunks(doc_id, owner_id=TEST_OWNER_ID)
         assert len(retrieved_chunks) == 1
         meta = retrieved_chunks[0]["metadata"]
 
@@ -300,16 +305,16 @@ class TestChromaVectorStore:
         chunk = self.make_dummy_chunk(doc_id, 0, "Duplicate test text.")
         norm_val = 1.0 / math.sqrt(384)
 
-        store.add_chunks([chunk], [[norm_val] * 384], content_hash="hash_dup")
+        store.add_chunks([chunk], [[norm_val] * 384], owner_id=TEST_OWNER_ID, content_hash="hash_dup")
 
         # Second attempt with same doc_id should raise DocumentAlreadyExistsError
         with pytest.raises(DocumentAlreadyExistsError):
-            store.add_chunks([chunk], [[norm_val] * 384], content_hash="different_hash")
+            store.add_chunks([chunk], [[norm_val] * 384], owner_id=TEST_OWNER_ID, content_hash="different_hash")
 
         # Third attempt with same content_hash should raise DocumentAlreadyExistsError
         chunk2 = self.make_dummy_chunk("different_doc_id", 0, "Duplicate test text.")
         with pytest.raises(DocumentAlreadyExistsError):
-            store.add_chunks([chunk2], [[norm_val] * 384], content_hash="hash_dup")
+            store.add_chunks([chunk2], [[norm_val] * 384], owner_id=TEST_OWNER_ID, content_hash="hash_dup")
 
     def test_delete_document(self, temp_store):
         store, _ = temp_store
@@ -319,13 +324,13 @@ class TestChromaVectorStore:
             self.make_dummy_chunk(doc_id, 1, "Chunk 2 to delete"),
         ]
         norm_val = 1.0 / math.sqrt(384)
-        store.add_chunks(chunks, [[norm_val] * 384, [norm_val] * 384])
+        store.add_chunks(chunks, [[norm_val] * 384, [norm_val] * 384], owner_id=TEST_OWNER_ID)
 
         assert store.count() == 2
-        deleted = store.delete_document(doc_id)
+        deleted = store.delete_document(doc_id, owner_id=TEST_OWNER_ID)
         assert deleted == 2
         assert store.count() == 0
-        assert store.has_document(doc_id) is False
+        assert store.has_document(doc_id, owner_id=TEST_OWNER_ID) is False
 
     def test_persistence_across_client_restarts(self):
         """Verify data persists on disk and is accessible after closing and reopening Chroma client."""
@@ -347,7 +352,7 @@ class TestChromaVectorStore:
                 word_count=8,
             )
             norm_val = 1.0 / math.sqrt(384)
-            store1.add_chunks([chunk], [[norm_val] * 384], content_hash="hash_restart")
+            store1.add_chunks([chunk], [[norm_val] * 384], owner_id=TEST_OWNER_ID, content_hash="hash_restart")
             assert store1.count() == 1
 
             # 2. Simulate complete shutdown: reset client cache and delete object
@@ -357,9 +362,9 @@ class TestChromaVectorStore:
             # 3. Simulate process restart: initialize completely new client pointing to same folder
             store2 = ChromaVectorStore(collection_name="persist_col", persist_directory=temp_dir)
             assert store2.count() == 1
-            assert store2.has_document("doc_restart") is True
+            assert store2.has_document("doc_restart", owner_id=TEST_OWNER_ID) is True
 
-            chunks = store2.get_document_chunks("doc_restart")
+            chunks = store2.get_document_chunks("doc_restart", owner_id=TEST_OWNER_ID)
             assert len(chunks) == 1
             assert chunks[0]["text"] == "Persistent content must survive application shutdown and restart."
             assert chunks[0]["metadata"]["content_hash"] == "hash_restart"
@@ -398,7 +403,7 @@ class TestIngestionServiceIntegration:
         ]
         pdf_bytes = make_test_pdf(pdf_pages)
 
-        result = service.ingest_document(pdf_bytes, filename="rag_foundations.pdf")
+        result = service.ingest_document(pdf_bytes, owner_id=TEST_OWNER_ID, filename="rag_foundations.pdf")
 
         assert result.status == "success"
         assert result.is_duplicate is False
@@ -409,7 +414,7 @@ class TestIngestionServiceIntegration:
         assert result.collection_name == "e2e_collection"
 
         # Verify chunks exist in ChromaDB
-        chunks = service.get_document_chunks(result.document_id)
+        chunks = service.get_document_chunks(result.document_id, owner_id=TEST_OWNER_ID)
         assert len(chunks) == result.total_chunks
         for c in chunks:
             assert c["metadata"]["filename"] == "rag_foundations.pdf"
@@ -424,7 +429,7 @@ class TestIngestionServiceIntegration:
             "Each component maintains single responsibility: extraction, cleaning, chunking, embedding, and vector storage."
         ).encode("utf-8")
 
-        result = service.ingest_document(txt_content, filename="architecture.txt")
+        result = service.ingest_document(txt_content, owner_id=TEST_OWNER_ID, filename="architecture.txt")
 
         assert result.status == "success"
         assert result.total_chunks >= 1
@@ -435,12 +440,12 @@ class TestIngestionServiceIntegration:
         pdf_bytes = make_test_pdf(["Identical document content for duplicate checking."])
 
         # First ingestion
-        res1 = service.ingest_document(pdf_bytes, filename="original.pdf")
+        res1 = service.ingest_document(pdf_bytes, owner_id=TEST_OWNER_ID, filename="original.pdf")
         assert res1.status == "success"
         assert res1.is_duplicate is False
 
         # Second ingestion with same bytes
-        res2 = service.ingest_document(pdf_bytes, filename="uploaded_again.pdf")
+        res2 = service.ingest_document(pdf_bytes, owner_id=TEST_OWNER_ID, filename="uploaded_again.pdf")
         assert res2.status == "duplicate"
         assert res2.is_duplicate is True
         assert res2.total_chunks == 0
@@ -449,10 +454,10 @@ class TestIngestionServiceIntegration:
     def test_e2e_delete_document(self, test_service):
         service, _ = test_service
         pdf_bytes = make_test_pdf(["Document content that will be deleted soon."])
-        res = service.ingest_document(pdf_bytes, filename="to_delete.pdf")
+        res = service.ingest_document(pdf_bytes, owner_id=TEST_OWNER_ID, filename="to_delete.pdf")
         assert service.vector_store.count() > 0
 
-        deleted_chunks = service.delete_document(res.document_id)
+        deleted_chunks = service.delete_document(res.document_id, owner_id=TEST_OWNER_ID)
         assert deleted_chunks == res.total_chunks
         assert service.vector_store.count() == 0
-        assert service.vector_store.has_document(res.document_id) is False
+        assert service.vector_store.has_document(res.document_id, owner_id=TEST_OWNER_ID) is False

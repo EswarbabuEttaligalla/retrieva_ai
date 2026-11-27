@@ -1,24 +1,26 @@
-"""Conversations module for persistent chat sessions, message history, and conversational query rewriting."""
+"""Conversations module for Supabase-backed chat sessions, message history, and query rewriting."""
 
 from backend.app.conversations.models import (
-    ConversationRecord,
     ConversationDetail,
-    MessageRecord,
+    ConversationRecord,
     CreateConversationRequest,
+    MessageRecord,
 )
-from backend.app.conversations.repository import ConversationRepository, get_conversation_repository
-from backend.app.conversations.service import ConversationService, get_conversation_service
 from backend.app.conversations.query_rewriter import ConversationalQueryRewriter, get_query_rewriter
+from backend.app.conversations.service import (
+    ConversationNotFoundError,
+    ConversationService,
+    get_conversation_service,
+)
 
 __all__ = [
-    "ConversationRecord",
     "ConversationDetail",
-    "MessageRecord",
-    "CreateConversationRequest",
-    "ConversationRepository",
-    "get_conversation_repository",
+    "ConversationNotFoundError",
+    "ConversationRecord",
     "ConversationService",
-    "get_conversation_service",
     "ConversationalQueryRewriter",
+    "CreateConversationRequest",
+    "MessageRecord",
+    "get_conversation_service",
     "get_query_rewriter",
 ]

@@ -1,17 +1,21 @@
 """RAG Pipeline Orchestration Service for Retrieva AI.
 
 Connects the Phase 4 Retrieval Engine with Phase 5 Context Construction,
-Prompt Engineering, OpenAI Inference, and Citation Validation.
+Prompt Engineering, OpenAI Inference, Citation Validation, and Supabase
+owner-scoped conversation persistence.
 """
 
 import asyncio
 import json
 import time
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple, Union
+from uuid import UUID
 
+from backend.app.conversations.service import ConversationNotFoundError
 from backend.app.core.config import get_settings
 from backend.app.core.logging import get_logger
 from backend.app.core.sse import format_sse_event
+from backend.app.core.supabase_client import SupabaseClientError, SupabaseUnavailableError
 from backend.app.llm.citation_validator import CitationValidator
 from backend.app.llm.client import OpenAIClient
 from backend.app.llm.context_builder import ContextBuilder
@@ -32,18 +36,13 @@ from backend.app.schemas.answer import (
     SourceCitation,
 )
 from backend.app.schemas.retrieval import RetrievalConfiguration, RetrievalRequest
+from backend.app.vector_store.store import normalize_owner_id
 
 logger = get_logger("services.rag_service")
 
 
 class RAGService:
-    """Production orchestrator executing the 10-step RAG answer generation lifecycle.
-
-    Guarantees:
-    - Step-by-step pipeline execution from query validation to verified citations.
-    - Full grounding verification without fabricating unsupported claims.
-    - Safe error containment preventing secret leakage or cryptic stack traces.
-    """
+    """Production orchestrator executing the grounded RAG answer generation lifecycle."""
 
     def __init__(
         self,
@@ -66,62 +65,78 @@ class RAGService:
         """Return the ConversationLockManager instance."""
         return self._lock_manager
 
-    def answer_question(self, request: AnswerRequest) -> AnswerResponse:
-        """Execute the complete end-to-end RAG answer generation pipeline.
+    @staticmethod
+    def _build_retrieval_request(request: AnswerRequest, query: str) -> RetrievalRequest:
+        """Assemble a RetrievalRequest preserving single and multi-document filters."""
+        retrieval_config = (
+            request.retrieval_config.model_copy()
+            if request.retrieval_config is not None
+            else RetrievalConfiguration(top_k=7)
+        )
+        if request.document_ids:
+            cleaned_doc_ids = [doc_id.strip() for doc_id in request.document_ids if doc_id and doc_id.strip()]
+            if (
+                len(cleaned_doc_ids) == 1
+                and not retrieval_config.document_id_filter
+                and not retrieval_config.document_ids_filter
+            ):
+                retrieval_config.document_id_filter = cleaned_doc_ids[0]
+            elif cleaned_doc_ids:
+                if retrieval_config.document_ids_filter:
+                    existing_set = {
+                        doc_id.strip()
+                        for doc_id in retrieval_config.document_ids_filter
+                        if doc_id and doc_id.strip()
+                    }
+                    retrieval_config.document_ids_filter = [
+                        doc_id for doc_id in cleaned_doc_ids if doc_id in existing_set
+                    ]
+                else:
+                    retrieval_config.document_ids_filter = cleaned_doc_ids
+        return RetrievalRequest(query=query, config=retrieval_config)
 
-        Pipeline Stages:
-        1. Validate the user question.
-        2. Retrieve relevant document chunks via Phase 4 Retrieval Engine.
-        3. Check for empty retrieval and trigger safe fallback if empty.
-        4. Build bounded context with strict token budgeting and stable IDs.
-        5. Construct grounded prompt with prompt-injection defense rules.
-        6. Dispatch request to OpenAI client.
-        7. Parse structured response (JSON or robust fallback).
-        8. Validate citations against admitted context chunks.
-        9. Assemble AnswerMetadata (token economics, latency, model info).
-        10. Return verified AnswerResponse.
-
-        Args:
-            request: Validated AnswerRequest model.
-
-        Returns:
-            AnswerResponse model with grounded text, citations, and metadata.
-
-        Raises:
-            ValueError: If query is invalid.
-            LLMError: If LLM service fails.
-        """
-        start_time = time.perf_counter()
-
-        # Step 1: Validate User Question & Pre-flight Request Token Budgeting
-        raw_query = (request.query or "").strip()
-        if not raw_query:
-            raise ValueError("Query string cannot be empty or whitespace-only.")
-
-        query = raw_query
-        rewritten_query = raw_query
-        conversation_service = None
-
-        if request.conversation_id:
-            from backend.app.conversations.service import get_conversation_service
-            conversation_service = self._conversation_service or get_conversation_service()
-            rewritten_query, _ = conversation_service.prepare_conversational_turn_sync(
-                conversation_id=request.conversation_id,
-                raw_query=raw_query,
+    @staticmethod
+    async def _persist_conversational_turn(
+        conv_svc: Any,
+        conversation_id: str,
+        owner_uuid: UUID,
+        raw_query: str,
+        rewritten_query: str,
+        assistant_content: Optional[str],
+        assistant_metadata: Optional[Dict[str, Any]] = None,
+        assistant_citations: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Persist the user message and optional verified assistant message to Supabase."""
+        await conv_svc.record_user_message(
+            conversation_id=conversation_id,
+            owner_id=owner_uuid,
+            raw_query=raw_query,
+            rewritten_query=rewritten_query,
+        )
+        if assistant_content is not None:
+            await conv_svc.record_assistant_message(
+                conversation_id=conversation_id,
+                owner_id=owner_uuid,
+                content=assistant_content,
+                metadata=assistant_metadata,
+                citations=assistant_citations,
             )
-            conversation_service.record_user_message(
-                conversation_id=request.conversation_id,
-                raw_query=raw_query,
-                rewritten_query=rewritten_query,
-            )
-            query = rewritten_query
 
+    def _assemble_non_conversational_answer(
+        self,
+        request: AnswerRequest,
+        owner_id: Union[UUID, str],
+        raw_query: str,
+        query: str,
+        rewritten_query: str,
+        start_time: float,
+        authorized_ready_doc_ids: Optional[Set[str]] = None,
+    ) -> Tuple[AnswerResponse, Optional[Dict[str, Any]], List[Dict[str, Any]], bool]:
+        """Execute synchronous retrieval, context assembly, generation, and citation verification."""
         settings = get_settings()
         reserved_completion_tokens = request.max_tokens or settings.DEFAULT_MAX_COMPLETION_TOKENS
         total_request_limit = settings.TOTAL_REQUEST_TOKEN_LIMIT
 
-        # Calculate dynamic allowed context budget before retrieval/LLM
-        # This will raise ValueError if question + base prompt exceeds total budget
         budget_report = self.context_builder.calculate_request_budget_report(
             query=query,
             reserved_completion_tokens=reserved_completion_tokens,
@@ -138,18 +153,35 @@ class RAGService:
             budget_report.model_context_limit,
         )
 
-        # Step 2: Retrieve Relevant Document Chunks via Phase 4 Retriever
-        retrieval_config = request.retrieval_config or RetrievalConfiguration()
-        if not retrieval_config.document_id_filter and request.document_ids:
-            retrieval_config.document_id_filter = request.document_ids[0]
-
-        retrieval_req = RetrievalRequest(
-            query=query,
-            document_ids=request.document_ids,
-            config=retrieval_config,
-        )
-        retrieval_result = self.retriever.retrieve(retrieval_req)
-        retrieved_chunks = retrieval_result.chunks
+        retrieval_req = self._build_retrieval_request(request, query)
+        if authorized_ready_doc_ids is not None:
+            retrieval_result = self.retriever.retrieve(
+                retrieval_req,
+                owner_id=owner_id,
+                authorized_ready_doc_ids=authorized_ready_doc_ids,
+            )
+            retrieved_chunks = [c for c in retrieval_result.chunks if c.document_id in authorized_ready_doc_ids]
+        else:
+            retrieval_result = self.retriever.retrieve(retrieval_req, owner_id=owner_id)
+            retrieved_chunks = retrieval_result.chunks
+        if retrieved_chunks and hasattr(self.retriever, "expand_table_continuations"):
+            if authorized_ready_doc_ids is not None:
+                expanded = self.retriever.expand_table_continuations(
+                    retrieved_chunks,
+                    owner_id=owner_id,
+                    authorized_ready_doc_ids=authorized_ready_doc_ids,
+                )
+            else:
+                expanded = self.retriever.expand_table_continuations(
+                    retrieved_chunks,
+                    owner_id=owner_id,
+                )
+            if isinstance(expanded, list):
+                retrieved_chunks = (
+                    [c for c in expanded if c.document_id in authorized_ready_doc_ids]
+                    if authorized_ready_doc_ids is not None
+                    else expanded
+                )
 
         logger.info(
             "Retrieved %d candidate chunks (mode=%s)",
@@ -157,18 +189,12 @@ class RAGService:
             retrieval_result.mode.value,
         )
 
-        # Step 3: Handle Empty Retrieval Result
+        # Empty retrieval -> verified insufficient-context fallback
         if not retrieved_chunks:
             logger.warning("Retrieval returned 0 chunks for query '%s'", query[:60])
             latency_ms = (time.perf_counter() - start_time) * 1000.0
             fallback_ans = "The available documents do not contain any information relevant to this question."
-            if conversation_service and request.conversation_id:
-                conversation_service.record_assistant_message(
-                    conversation_id=request.conversation_id,
-                    content=fallback_ans,
-                    metadata={"insufficient_context": True, "citations": []},
-                )
-            return AnswerResponse(
+            resp = AnswerResponse(
                 query=raw_query,
                 answer=fallback_ans,
                 conversation_id=request.conversation_id,
@@ -194,8 +220,9 @@ class RAGService:
                     latency_ms=round(latency_ms, 2),
                 ),
             )
+            return resp, {"insufficient_context": True, "citations": [], "retrieval_mode": retrieval_result.mode.value}, [], True
 
-        # Step 4: Build Bounded Context with Strict Token Accounting
+        # Context construction
         context_result = self.context_builder.build_context(
             retrieved_chunks,
             max_context_tokens=allowed_context_tokens,
@@ -205,13 +232,7 @@ class RAGService:
             logger.warning("No chunks fit into context budget for query '%s'", query[:60])
             latency_ms = (time.perf_counter() - start_time) * 1000.0
             fallback_ans = "The available document context is too large to process within the allocated token budget."
-            if conversation_service and request.conversation_id:
-                conversation_service.record_assistant_message(
-                    conversation_id=request.conversation_id,
-                    content=fallback_ans,
-                    metadata={"insufficient_context": True, "citations": []},
-                )
-            return AnswerResponse(
+            resp = AnswerResponse(
                 query=raw_query,
                 answer=fallback_ans,
                 conversation_id=request.conversation_id,
@@ -237,26 +258,21 @@ class RAGService:
                     latency_ms=round(latency_ms, 2),
                 ),
             )
+            return resp, {"insufficient_context": True, "citations": [], "retrieval_mode": retrieval_result.mode.value}, [], True
 
-        # Step 5: Construct Grounded Prompt with Injection Defense
+        # Grounded prompt & generation
         messages = PromptBuilder.build_messages(
             query=query,
             formatted_context=context_result.formatted_context,
         )
-
-        # Step 6: Dispatch Request to OpenAI Client
         llm_output = self.llm_client.generate(
             messages=messages,
             temperature=request.temperature,
             max_tokens=request.max_tokens,
         )
-
         raw_content = llm_output["content"]
-
-        # Step 7: Parse Structured Response (JSON or Prose Fallback)
         answer_text, insufficient_context, raw_citations = self._parse_model_output(raw_content)
 
-        # Step 8: Validate Citations Against Admitted Context Chunks
         validation_result = CitationValidator.validate_citations(
             raw_citations=raw_citations,
             answer_text=answer_text,
@@ -264,7 +280,7 @@ class RAGService:
             sources_excluded=context_result.sources_excluded,
         )
 
-        # Enforce Safe Failure Policy for Invalid Citations
+        should_persist_assistant = not validation_result.has_hallucinated_sources
         if validation_result.has_hallucinated_sources:
             logger.warning(
                 "Safe rejection triggered: LLM produced invalid or fabricated citations: %s",
@@ -276,35 +292,21 @@ class RAGService:
                 "substantiate this response."
             )
             insufficient_context = True
-            validated_citations = []
-            if conversation_service and request.conversation_id:
-                conversation_service.record_assistant_message(
-                    conversation_id=request.conversation_id,
-                    content=answer_text,
-                    metadata={
-                        "rejected": True,
-                        "reason": "Invalid or fabricated citations",
-                        "invalid_citations": validation_result.invalid_citations,
-                    },
-                )
+            validated_citations: List[SourceCitation] = []
+            persist_meta: Optional[Dict[str, Any]] = None
+            cit_dicts: List[Dict[str, Any]] = []
         else:
             validated_citations = validation_result.valid_citations
-            if conversation_service and request.conversation_id:
-                conversation_service.record_assistant_message(
-                    conversation_id=request.conversation_id,
-                    content=answer_text,
-                    metadata={
-                        "citations": [c.model_dump() for c in validated_citations],
-                        "insufficient_context": insufficient_context,
-                        "retrieval_mode": retrieval_result.mode.value,
-                    },
-                )
+            cit_dicts = [c.model_dump() for c in validated_citations]
+            persist_meta = {
+                "citations": cit_dicts,
+                "insufficient_context": insufficient_context,
+                "retrieval_mode": retrieval_result.mode.value,
+            }
 
-        # Warning when no citations are provided for non-insufficient response
         if not validated_citations and not insufficient_context and context_result.sources_used:
             logger.warning("Answer generated without explicit source citations despite non-empty context.")
 
-        # Step 9: Assemble Diagnostic Metadata
         latency_ms = (time.perf_counter() - start_time) * 1000.0
         metadata = AnswerMetadata(
             model_name=llm_output.get("model", self.llm_client.model),
@@ -323,8 +325,7 @@ class RAGService:
             latency_ms=round(latency_ms, 2),
         )
 
-        # Step 10: Return Final AnswerResponse
-        return AnswerResponse(
+        resp = AnswerResponse(
             query=raw_query,
             answer=answer_text,
             conversation_id=request.conversation_id,
@@ -335,6 +336,92 @@ class RAGService:
             sources_excluded=context_result.sources_excluded,
             metadata=metadata,
         )
+        return resp, persist_meta, cit_dicts, should_persist_assistant
+
+    def answer_question(
+        self,
+        request: AnswerRequest,
+        owner_id: Union[UUID, str],
+        authorized_ready_doc_ids: Optional[Set[str]] = None,
+    ) -> AnswerResponse:
+        """Synchronous RAG answer generation for standalone non-conversational callers."""
+        raw_query = (request.query or "").strip()
+        if not raw_query:
+            raise ValueError("Query string cannot be empty or whitespace-only.")
+        if request.conversation_id:
+            raise RuntimeError(
+                "Conversational answering requires Supabase async pipeline (answer_question_async); "
+                "SQLite fallback is disabled."
+            )
+
+        start_time = time.perf_counter()
+        resp, _, _, _ = self._assemble_non_conversational_answer(
+            request=request,
+            owner_id=owner_id,
+            raw_query=raw_query,
+            query=raw_query,
+            rewritten_query=raw_query,
+            start_time=start_time,
+            authorized_ready_doc_ids=authorized_ready_doc_ids,
+        )
+        return resp
+
+    async def answer_question_async(
+        self,
+        request: AnswerRequest,
+        owner_id: Union[UUID, str],
+        conversation_service: Optional[Any] = None,
+        authorized_ready_doc_ids: Optional[Set[str]] = None,
+    ) -> AnswerResponse:
+        """Execute full async RAG pipeline with Supabase owner-scoped conversation persistence."""
+        start_time = time.perf_counter()
+        raw_query = (request.query or "").strip()
+        if not raw_query:
+            raise ValueError("Query string cannot be empty or whitespace-only.")
+
+        owner_uuid = UUID(normalize_owner_id(owner_id))
+        query = raw_query
+        rewritten_query = raw_query
+        conv_svc = conversation_service or self._conversation_service
+
+        if request.conversation_id:
+            if conv_svc is None:
+                raise SupabaseUnavailableError(
+                    "Supabase conversation service is unavailable.",
+                    status_code=503,
+                    code="conversation_service_unavailable",
+                )
+            rewritten_query, _ = await conv_svc.prepare_conversational_turn(
+                conversation_id=request.conversation_id,
+                owner_id=owner_uuid,
+                raw_query=raw_query,
+            )
+            query = rewritten_query
+
+        resp, persist_meta, cit_dicts, should_persist_assistant = await asyncio.to_thread(
+            self._assemble_non_conversational_answer,
+            request,
+            owner_uuid,
+            raw_query,
+            query,
+            rewritten_query,
+            start_time,
+            authorized_ready_doc_ids,
+        )
+
+        if request.conversation_id and conv_svc is not None:
+            await self._persist_conversational_turn(
+                conv_svc=conv_svc,
+                conversation_id=request.conversation_id,
+                owner_uuid=owner_uuid,
+                raw_query=raw_query,
+                rewritten_query=rewritten_query,
+                assistant_content=resp.answer if should_persist_assistant else None,
+                assistant_metadata=persist_meta if should_persist_assistant else None,
+                assistant_citations=cit_dicts if should_persist_assistant else None,
+            )
+
+        return resp
 
     def _parse_model_output(self, content: str) -> tuple[str, bool, List[Dict[str, Any]]]:
         """Parse raw completion output into answer text, insufficient_context flag, and citations."""
@@ -359,7 +446,6 @@ class RAGService:
         except json.JSONDecodeError:
             pass
 
-        # Fallback for plain prose completion
         lower_content = content.lower()
         insufficient_phrases = [
             "not contain sufficient information",
@@ -371,28 +457,18 @@ class RAGService:
         insufficient = any(phrase in lower_content for phrase in insufficient_phrases)
         return content.strip(), insufficient, []
 
-    async def answer_question_stream(self, request: AnswerRequest) -> AsyncIterator[str]:
-        """Execute the real-time RAG streaming pipeline emitting SSE events.
-
-        Stages:
-        1. Request validation and pre-flight token budgeting.
-        2. Status: retrieving -> retrieve document chunks.
-        3. Optional status: reranking -> cross-encoder candidate scoring.
-        4. Status: building_context -> assemble bounded context.
-        5. Status: generating -> stream tokens from OpenAI model.
-        6. Status: verifying -> validate inline citations against admitted context.
-        7. If valid: emit 'citations' and terminal 'done'.
-        8. If rejected: emit 'rejection' and terminal 'done' (discarding unverified prose).
-        9. On error: emit 'error' and terminal 'done'.
-
-        Yields:
-            W3C-compliant SSE text frames.
-        """
+    async def answer_question_stream(
+        self,
+        request: AnswerRequest,
+        owner_id: Union[UUID, str],
+        conversation_service: Optional[Any] = None,
+        authorized_ready_doc_ids: Optional[Set[str]] = None,
+    ) -> AsyncIterator[str]:
+        """Execute the real-time RAG streaming pipeline emitting SSE events with Supabase persistence."""
         start_time = time.perf_counter()
         acquired_cid = await self._lock_manager.acquire(request.conversation_id)
 
         try:
-            # 1. Validation & Pre-flight Token Budgeting
             raw_query = (request.query or "").strip()
             if not raw_query:
                 yield format_sse_event(
@@ -402,26 +478,36 @@ class RAGService:
                 yield format_sse_event("done", {"finished": True})
                 return
 
+            owner_uuid = UUID(normalize_owner_id(owner_id))
             query = raw_query
             rewritten_query = raw_query
-            conversation_service = None
+            conv_svc = conversation_service or self._conversation_service
 
             if request.conversation_id:
-                from backend.app.conversations.service import get_conversation_service, ConversationNotFoundError
-                conversation_service = self._conversation_service or get_conversation_service()
-                try:
-                    rewritten_query, _ = await conversation_service.prepare_conversational_turn(
-                        conversation_id=request.conversation_id,
-                        raw_query=raw_query,
+                if conv_svc is None:
+                    yield format_sse_event(
+                        "error",
+                        {"code": "service_unavailable", "message": "Supabase conversation service is unavailable."},
                     )
-                    await conversation_service.record_user_message_async(
+                    yield format_sse_event("done", {"finished": True})
+                    return
+                try:
+                    rewritten_query, _ = await conv_svc.prepare_conversational_turn(
                         conversation_id=request.conversation_id,
+                        owner_id=owner_uuid,
                         raw_query=raw_query,
-                        rewritten_query=rewritten_query,
                     )
                     query = rewritten_query
                 except ConversationNotFoundError as not_found_err:
                     yield format_sse_event("error", {"code": "not_found", "message": str(not_found_err)})
+                    yield format_sse_event("done", {"finished": True})
+                    return
+                except SupabaseClientError as sb_err:
+                    logger.error("Supabase failure preparing conversational stream: %s", sb_err.message)
+                    yield format_sse_event(
+                        "error",
+                        {"code": "service_unavailable", "message": sb_err.message},
+                    )
                     yield format_sse_event("done", {"finished": True})
                     return
 
@@ -440,10 +526,7 @@ class RAGService:
                 )
             except ValueError as exc:
                 logger.warning("Query rejected by token budget guard: %s", exc)
-                yield format_sse_event(
-                    "error",
-                    {"code": "query_too_large", "message": str(exc)},
-                )
+                yield format_sse_event("error", {"code": "query_too_large", "message": str(exc)})
                 yield format_sse_event("done", {"finished": True})
                 return
 
@@ -453,27 +536,45 @@ class RAGService:
             yield format_sse_event("status", {"stage": "retrieving", "message": "Searching the knowledge base..."})
             await asyncio.sleep(0)
 
-            retrieval_config = request.retrieval_config or RetrievalConfiguration()
-            if not retrieval_config.document_id_filter and request.document_ids:
-                retrieval_config.document_id_filter = request.document_ids[0]
+            retrieval_req = self._build_retrieval_request(request, query)
+            if authorized_ready_doc_ids is not None:
+                retrieval_result = await asyncio.to_thread(
+                    self.retriever.retrieve,
+                    retrieval_req,
+                    owner_uuid,
+                    authorized_ready_doc_ids,
+                )
+                retrieved_chunks = [c for c in retrieval_result.chunks if c.document_id in authorized_ready_doc_ids]
+            else:
+                retrieval_result = await asyncio.to_thread(self.retriever.retrieve, retrieval_req, owner_uuid)
+                retrieved_chunks = retrieval_result.chunks
+            if retrieved_chunks and hasattr(self.retriever, "expand_table_continuations"):
+                if authorized_ready_doc_ids is not None:
+                    expanded = await asyncio.to_thread(
+                        self.retriever.expand_table_continuations,
+                        retrieved_chunks,
+                        owner_uuid,
+                        10,
+                        authorized_ready_doc_ids,
+                    )
+                else:
+                    expanded = await asyncio.to_thread(
+                        self.retriever.expand_table_continuations,
+                        retrieved_chunks,
+                        owner_uuid,
+                    )
+                if isinstance(expanded, list):
+                    retrieved_chunks = (
+                        [c for c in expanded if c.document_id in authorized_ready_doc_ids]
+                        if authorized_ready_doc_ids is not None
+                        else expanded
+                    )
 
-            retrieval_req = RetrievalRequest(
-                query=query,
-                document_ids=request.document_ids,
-                config=retrieval_config,
-            )
-
-            retrieval_start = time.perf_counter()
-            retrieval_result = self.retriever.retrieve(retrieval_req)
-            retrieval_ms = (time.perf_counter() - retrieval_start) * 1000.0
-            retrieved_chunks = retrieval_result.chunks
-
-            # Reranking status notification if reranking was performed
-            if retrieval_config.enable_reranking and retrieved_chunks:
+            if retrieval_req.config.enable_reranking and retrieved_chunks:
                 yield format_sse_event("status", {"stage": "reranking", "message": "Applying Cross-Encoder neural reranker..."})
                 await asyncio.sleep(0)
 
-            # 3. Handle Empty Retrieval
+            # 3. Empty Retrieval Fallback
             if not retrieved_chunks:
                 logger.warning("Streaming retrieval returned 0 chunks for query '%s'", query[:60])
                 fallback_text = "The available documents do not contain any information relevant to this question."
@@ -499,12 +600,30 @@ class RAGService:
                     latency_ms=round(latency_ms, 2),
                 )
 
-                if conversation_service and request.conversation_id:
-                    await conversation_service.record_assistant_message_async(
-                        conversation_id=request.conversation_id,
-                        content=fallback_text,
-                        metadata={"insufficient_context": True, "citations": []},
-                    )
+                if conv_svc and request.conversation_id:
+                    try:
+                        await self._persist_conversational_turn(
+                            conv_svc=conv_svc,
+                            conversation_id=request.conversation_id,
+                            owner_uuid=owner_uuid,
+                            raw_query=raw_query,
+                            rewritten_query=rewritten_query,
+                            assistant_content=fallback_text,
+                            assistant_metadata={
+                                "insufficient_context": True,
+                                "citations": [],
+                                "retrieval_mode": retrieval_result.mode.value,
+                            },
+                            assistant_citations=[],
+                        )
+                    except SupabaseClientError as sb_err:
+                        logger.error("Failed persisting empty-retrieval stream turn: %s", sb_err.message)
+                        yield format_sse_event(
+                            "error",
+                            {"code": "persistence_error", "message": "Failed to save conversation turn to Supabase."},
+                        )
+                        yield format_sse_event("done", {"finished": True})
+                        return
 
                 yield format_sse_event(
                     "citations",
@@ -522,12 +641,10 @@ class RAGService:
             yield format_sse_event("status", {"stage": "building_context", "message": "Assembling bounded context payload..."})
             await asyncio.sleep(0)
 
-            context_start = time.perf_counter()
             context_result = self.context_builder.build_context(
                 retrieved_chunks,
                 max_context_tokens=allowed_context_tokens,
             )
-            context_ms = (time.perf_counter() - context_start) * 1000.0
 
             if not context_result.sources_used:
                 logger.warning("No chunks fit into context budget for streaming query '%s'", query[:60])
@@ -554,12 +671,30 @@ class RAGService:
                     latency_ms=round(latency_ms, 2),
                 )
 
-                if conversation_service and request.conversation_id:
-                    await conversation_service.record_assistant_message_async(
-                        conversation_id=request.conversation_id,
-                        content=fallback_text,
-                        metadata={"insufficient_context": True, "citations": []},
-                    )
+                if conv_svc and request.conversation_id:
+                    try:
+                        await self._persist_conversational_turn(
+                            conv_svc=conv_svc,
+                            conversation_id=request.conversation_id,
+                            owner_uuid=owner_uuid,
+                            raw_query=raw_query,
+                            rewritten_query=rewritten_query,
+                            assistant_content=fallback_text,
+                            assistant_metadata={
+                                "insufficient_context": True,
+                                "citations": [],
+                                "retrieval_mode": retrieval_result.mode.value,
+                            },
+                            assistant_citations=[],
+                        )
+                    except SupabaseClientError as sb_err:
+                        logger.error("Failed persisting budget-overflow stream turn: %s", sb_err.message)
+                        yield format_sse_event(
+                            "error",
+                            {"code": "persistence_error", "message": "Failed to save conversation turn to Supabase."},
+                        )
+                        yield format_sse_event("done", {"finished": True})
+                        return
 
                 yield format_sse_event(
                     "citations",
@@ -584,10 +719,8 @@ class RAGService:
             await asyncio.sleep(0)
 
             full_answer_buffer: List[str] = []
-            gen_start = time.perf_counter()
             first_token_time: Optional[float] = None
 
-            # Obtain token stream: prefer generate_stream_async if available, fallback to generate_stream
             token_stream = None
             if hasattr(self.llm_client, "generate_stream_async"):
                 token_stream = self.llm_client.generate_stream_async(
@@ -606,7 +739,6 @@ class RAGService:
 
             sync_lock = None
             try:
-                # If stream is an asynchronous generator/iterator, consume natively without blocking
                 if hasattr(token_stream, "__anext__") or hasattr(token_stream, "__aiter__"):
                     async for chunk_str in token_stream:
                         if first_token_time is None:
@@ -615,10 +747,6 @@ class RAGService:
                         yield format_sse_event("token", {"delta": chunk_str})
                         await asyncio.sleep(0)
                 else:
-                    # Synchronous iterator fallback: read each item in a worker thread via asyncio.to_thread
-                    # ensuring that slow network reads never freeze the FastAPI asyncio event loop.
-                    # Safe synchronization is used to prevent concurrent next() and close() collisions
-                    # (ValueError: generator already executing).
                     import threading
                     sync_lock = threading.Lock()
                     sentinel = object()
@@ -646,9 +774,6 @@ class RAGService:
                     elif hasattr(token_stream, "close"):
                         try:
                             def _safe_close():
-                                # In Python, OS worker threads cannot be forcibly killed by asyncio.
-                                # If a worker thread is still executing inside next(), calling close()
-                                # concurrently raises ValueError: generator already executing.
                                 acquired = sync_lock.acquire(timeout=0.05) if sync_lock is not None else True
                                 if acquired:
                                     try:
@@ -656,15 +781,10 @@ class RAGService:
                                     finally:
                                         if sync_lock is not None:
                                             sync_lock.release()
-                                else:
-                                    logger.debug("Synchronous iterator worker thread is still active; skipped concurrent close to avoid generator execution race.")
 
                             await asyncio.to_thread(_safe_close)
                         except ValueError as val_err:
-                            if "generator already executing" in str(val_err):
-                                logger.debug("Synchronous generator was executing concurrently during cleanup: %s", val_err)
-                            else:
-                                logger.debug("ValueError during synchronous token_stream close: %s", val_err)
+                            logger.debug("Concurrent close notice on sync token_stream: %s", val_err)
                         except Exception as close_err:
                             logger.debug("Closing sync token_stream notice: %s", close_err)
 
@@ -689,12 +809,15 @@ class RAGService:
                 "do not contain enough information",
                 "cannot answer this question based on the provided",
             ]
-            insufficient_context = any(phrase in lower_answer for phrase in insufficient_phrases)
+            insufficient_context = any(phrase in lower_answer for phrase in insufficient_phrases) or (
+                not validation_result.valid_citations
+                and "not reported in the provided document evidence" in lower_answer
+            )
 
             latency_ms = (time.perf_counter() - start_time) * 1000.0
             ttft_ms = round((first_token_time - start_time) * 1000.0, 2) if first_token_time else None
 
-            # Enforce Safe Rejection Policy: If citations are hallucinated, discard provisional text
+            # Enforce Safe Rejection Policy: NEVER persist assistant message with invalid/fabricated citations
             if validation_result.has_hallucinated_sources:
                 logger.warning(
                     "Streaming safe rejection triggered: invalid/fabricated citations: %s",
@@ -705,16 +828,25 @@ class RAGService:
                     "fabricated, or excluded source citations. The available documents do not "
                     "substantiate this response."
                 )
-                if conversation_service and request.conversation_id:
-                    await conversation_service.record_assistant_message_async(
-                        conversation_id=request.conversation_id,
-                        content=safe_fallback_prose,
-                        metadata={
-                            "rejected": True,
-                            "reason": "Citation verification failed due to invalid, fabricated, or excluded source references.",
-                            "invalid_citations": validation_result.invalid_citations,
-                        },
-                    )
+                if conv_svc and request.conversation_id:
+                    try:
+                        await self._persist_conversational_turn(
+                            conv_svc=conv_svc,
+                            conversation_id=request.conversation_id,
+                            owner_uuid=owner_uuid,
+                            raw_query=raw_query,
+                            rewritten_query=rewritten_query,
+                            assistant_content=None,
+                        )
+                    except SupabaseClientError as sb_err:
+                        logger.error("Failed recording rejected stream user turn: %s", sb_err.message)
+                        yield format_sse_event(
+                            "error",
+                            {"code": "persistence_error", "message": "Failed to persist conversation state."},
+                        )
+                        yield format_sse_event("done", {"finished": True})
+                        return
+
                 yield format_sse_event(
                     "rejection",
                     {
@@ -727,19 +859,9 @@ class RAGService:
                 yield format_sse_event("done", {"finished": True})
                 return
 
-            # Successful Citation Validation
+            # Successful Citation Validation -> Persist user + verified assistant message
             validated_citations = validation_result.valid_citations
-            if conversation_service and request.conversation_id:
-                await conversation_service.record_assistant_message_async(
-                    conversation_id=request.conversation_id,
-                    content=accumulated_answer,
-                    metadata={
-                        "citations": [c.model_dump() for c in validated_citations],
-                        "insufficient_context": insufficient_context,
-                        "retrieval_mode": retrieval_result.mode.value,
-                        "latency_ms": round(latency_ms, 2),
-                    },
-                )
+            cit_dicts = [c.model_dump() for c in validated_citations]
             metadata = AnswerMetadata(
                 model_name=self.llm_client.model,
                 retrieval_mode=retrieval_result.mode.value,
@@ -757,11 +879,37 @@ class RAGService:
                 latency_ms=round(latency_ms, 2),
             )
 
+            if conv_svc and request.conversation_id:
+                try:
+                    await self._persist_conversational_turn(
+                        conv_svc=conv_svc,
+                        conversation_id=request.conversation_id,
+                        owner_uuid=owner_uuid,
+                        raw_query=raw_query,
+                        rewritten_query=rewritten_query,
+                        assistant_content=accumulated_answer,
+                        assistant_metadata={
+                            "citations": cit_dicts,
+                            "insufficient_context": insufficient_context,
+                            "retrieval_mode": retrieval_result.mode.value,
+                            "latency_ms": round(latency_ms, 2),
+                        },
+                        assistant_citations=cit_dicts,
+                    )
+                except SupabaseClientError as sb_err:
+                    logger.error("Failed persisting verified streaming assistant turn: %s", sb_err.message)
+                    yield format_sse_event(
+                        "error",
+                        {"code": "persistence_error", "message": "Failed to persist verified assistant response to Supabase."},
+                    )
+                    yield format_sse_event("done", {"finished": True})
+                    return
+
             yield format_sse_event(
                 "citations",
                 {
                     "status": "verified",
-                    "citations": [c.model_dump() for c in validated_citations],
+                    "citations": cit_dicts,
                     "insufficient_context": insufficient_context,
                     "metadata": metadata.model_dump(),
                     "ttft_ms": ttft_ms,
@@ -770,8 +918,17 @@ class RAGService:
             yield format_sse_event("done", {"finished": True})
 
         except GeneratorExit:
-            logger.info("Streaming client disconnected; generator exited.")
+            logger.info("Streaming client disconnected; generator exited without persisting partial output.")
             raise
+
+        except asyncio.CancelledError:
+            logger.info("Streaming request cancelled; skipping partial persistence.")
+            raise
+
+        except ValueError as exc:
+            logger.warning("Streaming validation/isolation failure: %s", exc)
+            yield format_sse_event("error", {"code": "invalid_request", "message": str(exc)})
+            yield format_sse_event("done", {"finished": True})
 
         except LLMAuthenticationError as exc:
             logger.error("Streaming LLM auth error: %s", exc.message)

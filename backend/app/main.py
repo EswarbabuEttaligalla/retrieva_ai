@@ -20,23 +20,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Starting up %s (version: %s, env: %s)...", settings.PROJECT_NAME, settings.APP_VERSION, settings.APP_ENV)
     logger.info("CORS allowed origins: %s", settings.BACKEND_CORS_ORIGINS)
     
-    # Reconcile Document Registry and BM25 index with persistent ChromaDB store on startup
+    # Initialize ChromaDB vector store handle on startup
+    # Note: Do NOT initialize legacy SQLite conversation DB or load global registries/BM25 indexes at startup.
+    # Conversations and messages persist in Supabase; per-tenant BM25 partitions hydrate lazily on demand.
     try:
-        from backend.app.services.ingestion_service import get_ingestion_service
-        from backend.app.retrieval.retriever import get_retriever
-        from backend.app.conversations.database import init_conversation_db
-        svc = get_ingestion_service()
-        svc.registry.reconcile_from_vector_store(svc.vector_store, prune_orphans=True)
-        retriever = get_retriever()
-        retriever.sync_bm25_with_vector_store()
-        init_conversation_db()
-        logger.info("Startup reconciliation complete: Registry, ChromaDB, BM25, and Conversation DB synchronized.")
+        from backend.app.vector_store.store import ChromaVectorStore
+        ChromaVectorStore()
+        logger.info("Startup initialization complete: ChromaDB ready (Supabase conversations; per-tenant BM25 lazy).")
     except Exception as exc:
-        logger.warning("Startup reconciliation warning: %s", exc)
+        logger.warning("Startup initialization warning: %s", exc)
 
     yield
     
     logger.info("Shutting down %s...", settings.PROJECT_NAME)
+    try:
+        from backend.app.core.supabase_client import close_supabase_http_client
+        await close_supabase_http_client()
+        logger.info("Supabase async HTTP pool closed.")
+    except Exception as exc:
+        logger.warning("Error during Supabase async HTTP pool shutdown: %s", exc)
     try:
         from backend.app.llm.client import OpenAIClient
         if OpenAIClient._instance is not None:

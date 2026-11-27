@@ -1,11 +1,13 @@
 """ChromaDB vector store implementation for Retrieva AI.
 
 Provides persistent storage, metadata serialization/deserialization,
-duplicate prevention, atomic chunk ingestion, and document lifecycle management.
+per-owner duplicate prevention, atomic chunk ingestion, mandatory owner_id
+filtering on all lookups/queries/deletions, and defensive post-retrieval checks.
 """
 
-from typing import Any, Dict, List, Optional, Set
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Union
+from uuid import UUID
 
 import chromadb
 from chromadb.api import ClientAPI
@@ -13,8 +15,8 @@ from chromadb.api.models.Collection import Collection
 
 from backend.app.core.config import get_settings
 from backend.app.core.logging import get_logger
+from backend.app.embeddings.validator import EmbeddingValidationError, validate_batch_embeddings
 from backend.app.schemas.document import DocumentChunk
-from backend.app.embeddings.validator import validate_batch_embeddings, EmbeddingValidationError
 from backend.app.vector_store.client import get_chroma_client
 
 logger = get_logger("vector_store.store")
@@ -26,7 +28,7 @@ class VectorStoreError(Exception):
 
 
 class DocumentAlreadyExistsError(VectorStoreError):
-    """Raised when attempting to add a document that is already ingested."""
+    """Raised when attempting to add a document that is already ingested for this owner."""
     pass
 
 
@@ -35,11 +37,29 @@ class VectorStoreInsertionError(VectorStoreError):
     pass
 
 
+class TenantIsolationError(VectorStoreError):
+    """Raised when a vector store operation detects missing or mismatched owner_id."""
+    pass
+
+
+def normalize_owner_id(owner_id: Union[UUID, str]) -> str:
+    """Validate and normalize owner_id as a canonical lowercase UUID string."""
+    if isinstance(owner_id, UUID):
+        return str(owner_id)
+    if isinstance(owner_id, str) and owner_id.strip():
+        try:
+            return str(UUID(owner_id.strip()))
+        except ValueError as exc:
+            raise ValueError("owner_id must be a valid UUID.") from exc
+    raise ValueError("A valid UUID owner_id is required.")
+
+
 class ChromaVectorStore:
-    """Manages persistent document vector storage in ChromaDB.
+    """Manages persistent document vector storage in ChromaDB with mandatory tenant isolation.
 
     Enforces explicit embeddings generation (Sentence Transformers) and bypasses
-    ChromaDB's internal embedding functions.
+    ChromaDB's internal embedding functions. Every chunk carries `owner_id` metadata
+    and every read, query, and delete operation requires an explicit `owner_id`.
     """
 
     def __init__(
@@ -48,23 +68,12 @@ class ChromaVectorStore:
         persist_directory: Optional[str] = None,
         client: Optional[ClientAPI] = None,
     ) -> None:
-        """Initialize the vector store with persistent storage and cosine distance.
-
-        Args:
-            collection_name: Name of the ChromaDB collection. Defaults to config setting.
-            persist_directory: Directory for persistent Chroma storage.
-            client: Optional pre-configured ChromaDB ClientAPI instance.
-        """
         settings = get_settings()
         self.collection_name = collection_name or settings.CHROMA_COLLECTION_NAME
         self.persist_directory = persist_directory or settings.CHROMA_PERSIST_DIRECTORY
         self.expected_dim = settings.EMBEDDING_DIMENSION
 
-        # Initialize persistent client
         self.client: ClientAPI = client or get_chroma_client(self.persist_directory)
-
-        # Get or create collection with explicit cosine similarity configuration
-        # Note: We do NOT pass an embedding_function to ensure raw embeddings are supplied
         self.collection: Collection = self.client.get_or_create_collection(
             name=self.collection_name,
             metadata={"hnsw:space": "cosine"},
@@ -78,43 +87,73 @@ class ChromaVectorStore:
             self.collection.count(),
         )
 
+    @staticmethod
+    def _build_owner_where(
+        owner_str: str,
+        extra_filter: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Build a ChromaDB `where` clause always scoped to `owner_id`."""
+        owner_clause = {"owner_id": owner_str}
+        if not extra_filter:
+            return owner_clause
+        return {"$and": [owner_clause, extra_filter]}
+
+    @staticmethod
+    def _assert_records_owned(
+        metadatas: List[Optional[Dict[str, Any]]],
+        owner_str: str,
+        operation: str,
+    ) -> None:
+        """Defensive post-retrieval check: reject any chunk lacking matching owner_id."""
+        for raw_meta in metadatas:
+            meta = raw_meta or {}
+            record_owner = meta.get("owner_id")
+            if record_owner != owner_str:
+                logger.error(
+                    "SECURITY ALERT: Cross-tenant vector blocked during %s (expected_owner=%s, actual_owner=%s, document_id=%s)",
+                    operation,
+                    owner_str,
+                    record_owner,
+                    meta.get("document_id"),
+                )
+                raise TenantIsolationError(
+                    "Cross-tenant vector access prevented by ownership verification."
+                )
+
     def count(self) -> int:
-        """Return total number of chunks currently stored in the collection."""
+        """Return total number of chunks across the collection (system metric only)."""
         return self.collection.count()
 
-    def has_document(self, document_id: str) -> bool:
-        """Check if any chunk belonging to the given document_id exists.
+    def count_for_owner(self, owner_id: Union[UUID, str]) -> int:
+        """Return total number of chunks stored for a specific owner_id."""
+        owner_str = normalize_owner_id(owner_id)
+        results = self.collection.get(
+            where={"owner_id": owner_str},
+            include=[],
+        )
+        return len(results.get("ids") or [])
 
-        Args:
-            document_id: Unique SHA-256 or string identifier of the document.
-
-        Returns:
-            True if the document is present, False otherwise.
-        """
+    def has_document(self, document_id: str, owner_id: Union[UUID, str]) -> bool:
+        """Check if any chunk belonging to (owner_id, document_id) exists."""
+        owner_str = normalize_owner_id(owner_id)
         if not document_id:
             return False
 
         results = self.collection.get(
-            where={"document_id": document_id},
+            where=self._build_owner_where(owner_str, {"document_id": document_id}),
             limit=1,
             include=[],
         )
         return bool(results and results.get("ids") and len(results["ids"]) > 0)
 
-    def has_content_hash(self, content_hash: str) -> bool:
-        """Check if a document with the exact content hash already exists.
-
-        Args:
-            content_hash: SHA-256 hash of the cleaned or raw document content.
-
-        Returns:
-            True if content hash exists, False otherwise.
-        """
+    def has_content_hash(self, content_hash: str, owner_id: Union[UUID, str]) -> bool:
+        """Check if a document with content_hash exists for this specific owner_id."""
+        owner_str = normalize_owner_id(owner_id)
         if not content_hash:
             return False
 
         results = self.collection.get(
-            where={"content_hash": content_hash},
+            where=self._build_owner_where(owner_str, {"content_hash": content_hash}),
             limit=1,
             include=[],
         )
@@ -123,26 +162,17 @@ class ChromaVectorStore:
     def serialize_metadata(
         self,
         chunk: DocumentChunk,
+        owner_id: Union[UUID, str],
         content_hash: Optional[str] = None,
         embedding_model: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Convert chunk metadata into ChromaDB-compatible scalar types.
-
-        ChromaDB metadata strictly accepts: str, int, float, bool.
-        Lists such as page_references must be serialized to comma-delimited strings.
-
-        Args:
-            chunk: DocumentChunk instance.
-            content_hash: Content hash for duplicate tracking.
-            embedding_model: Identifier of the embedding model used.
-
-        Returns:
-            Dict containing scalar metadata fields.
-        """
+        """Convert chunk metadata into ChromaDB-compatible scalar types including owner_id."""
+        owner_str = normalize_owner_id(owner_id)
         settings = get_settings()
         page_refs_str = ",".join(str(p) for p in chunk.page_references)
 
         return {
+            "owner_id": owner_str,
             "chunk_id": chunk.chunk_id,
             "document_id": chunk.document_id,
             "filename": chunk.filename,
@@ -158,16 +188,7 @@ class ChromaVectorStore:
         }
 
     def deserialize_metadata(self, raw_meta: Dict[str, Any]) -> Dict[str, Any]:
-        """Deserialize scalar metadata fields back to structured Python types.
-
-        Reconstructs page_references list from comma-delimited string.
-
-        Args:
-            raw_meta: Raw metadata dictionary from ChromaDB.
-
-        Returns:
-            Dictionary with parsed page_references as List[int].
-        """
+        """Deserialize scalar metadata fields back to structured Python types."""
         meta = dict(raw_meta)
         page_refs_str = meta.get("page_references", "")
         if isinstance(page_refs_str, str) and page_refs_str.strip():
@@ -188,34 +209,14 @@ class ChromaVectorStore:
         self,
         chunks: List[DocumentChunk],
         embeddings: List[List[float]],
+        owner_id: Union[UUID, str],
         content_hash: Optional[str] = None,
         embedding_model: Optional[str] = None,
         prevent_duplicates: bool = True,
     ) -> int:
-        """Add document chunks and their precomputed embeddings into ChromaDB.
+        """Add document chunks and precomputed embeddings into ChromaDB under owner_id."""
+        owner_str = normalize_owner_id(owner_id)
 
-        Performs:
-        1. Length and dimensional validation.
-        2. Duplicate detection check.
-        3. Metadata serialization.
-        4. Atomic-like insertion with automatic rollback on error.
-
-        Args:
-            chunks: List of DocumentChunk objects.
-            embeddings: Corresponding list of 384-dimensional float vectors.
-            content_hash: SHA-256 hash of the source document content.
-            embedding_model: Name of the embedding model used.
-            prevent_duplicates: If True, raises DocumentAlreadyExistsError if doc exists.
-
-        Returns:
-            Total number of chunks successfully stored.
-
-        Raises:
-            ValueError: If chunks and embeddings lengths do not match or are empty.
-            DocumentAlreadyExistsError: If document already exists and prevent_duplicates is True.
-            EmbeddingValidationError: If any embedding vector fails validation.
-            VectorStoreInsertionError: If ChromaDB insertion fails.
-        """
         if not chunks:
             raise ValueError("Chunks list cannot be empty.")
         if len(chunks) != len(embeddings):
@@ -225,32 +226,35 @@ class ChromaVectorStore:
 
         document_id = chunks[0].document_id
 
-        # Duplicate checking
         if prevent_duplicates:
-            if self.has_document(document_id):
+            if self.has_document(document_id, owner_id=owner_str):
                 raise DocumentAlreadyExistsError(
-                    f"Document with ID '{document_id}' already exists in vector store."
+                    f"Document with ID '{document_id}' already exists for this owner."
                 )
-            if content_hash and self.has_content_hash(content_hash):
+            if content_hash and self.has_content_hash(content_hash, owner_id=owner_str):
                 raise DocumentAlreadyExistsError(
-                    f"Document with identical content hash '{content_hash}' already exists in vector store."
+                    f"Document with identical content hash '{content_hash}' already exists for this owner."
                 )
 
-        # Validate all embeddings before attempting insertion
         validate_batch_embeddings(embeddings, expected_dim=self.expected_dim)
 
-        # Prepare payloads for ChromaDB
         ids: List[str] = [chunk.chunk_id for chunk in chunks]
         documents: List[str] = [chunk.text for chunk in chunks]
         metadatas: List[Dict[str, Any]] = [
-            self.serialize_metadata(chunk, content_hash=content_hash, embedding_model=embedding_model)
+            self.serialize_metadata(
+                chunk,
+                owner_id=owner_str,
+                content_hash=content_hash,
+                embedding_model=embedding_model,
+            )
             for chunk in chunks
         ]
 
         logger.info(
-            "Inserting %d chunks into ChromaDB for document '%s'...",
+            "Inserting %d chunks into ChromaDB for document '%s' (owner=%s)...",
             len(chunks),
             document_id,
+            owner_str,
         )
 
         try:
@@ -261,49 +265,47 @@ class ChromaVectorStore:
                 metadatas=metadatas,
             )
             logger.info(
-                "Persisted %d chunks to ChromaDB for document '%s' (collection total=%d)",
+                "Persisted %d chunks to ChromaDB for document '%s' (owner=%s)",
                 len(chunks),
                 document_id,
-                self.collection.count(),
+                owner_str,
             )
             return len(chunks)
 
         except Exception as exc:
             logger.error("ChromaDB chunk insertion failed for '%s': %s", document_id, exc)
-            # Rollback: Clean up any partially inserted chunks for this document
             try:
-                self.delete_document(document_id)
+                self.delete_document(document_id, owner_id=owner_str)
             except Exception as rollback_err:
                 logger.critical("Rollback cleanup failed for '%s': %s", document_id, rollback_err)
             raise VectorStoreInsertionError(
                 f"Failed to insert chunks into ChromaDB for document '{document_id}': {str(exc)}"
             ) from exc
 
-    def get_document_chunks(self, document_id: str) -> List[Dict[str, Any]]:
-        """Retrieve all stored chunks for a given document_id ordered by chunk_index.
-
-        Args:
-            document_id: Unique document identifier.
-
-        Returns:
-            List of dictionaries containing chunk details and deserialized metadata.
-        """
+    def get_document_chunks(
+        self,
+        document_id: str,
+        owner_id: Union[UUID, str],
+    ) -> List[Dict[str, Any]]:
+        """Retrieve all stored chunks for (owner_id, document_id) ordered by chunk_index."""
+        owner_str = normalize_owner_id(owner_id)
         if not document_id:
             return []
 
         results = self.collection.get(
-            where={"document_id": document_id},
+            where=self._build_owner_where(owner_str, {"document_id": document_id}),
             include=["documents", "metadatas"],
         )
 
-        if not results or not results.get("ids"):
+        ids = results.get("ids") or []
+        if not ids:
             return []
 
-        chunks: List[Dict[str, Any]] = []
-        ids = results.get("ids", [])
-        docs = results.get("documents", [])
-        metas = results.get("metadatas", [])
+        docs = results.get("documents") or []
+        metas = results.get("metadatas") or []
+        self._assert_records_owned(metas, owner_str, "get_document_chunks")
 
+        chunks: List[Dict[str, Any]] = []
         for idx, chunk_id in enumerate(ids):
             doc_text = docs[idx] if idx < len(docs) else ""
             raw_meta = metas[idx] if idx < len(metas) else {}
@@ -312,6 +314,7 @@ class ChromaVectorStore:
             chunks.append({
                 "chunk_id": chunk_id,
                 "document_id": document_id,
+                "owner_id": owner_str,
                 "text": doc_text,
                 "metadata": deserialized_meta,
                 "chunk_index": deserialized_meta.get("chunk_index", 0),
@@ -320,61 +323,152 @@ class ChromaVectorStore:
         chunks.sort(key=lambda x: x["chunk_index"])
         return chunks
 
-    def delete_document(self, document_id: str) -> int:
-        """Delete all chunks belonging to a document from ChromaDB.
+    def get_owner_chunks(self, owner_id: Union[UUID, str]) -> List[Dict[str, Any]]:
+        """Retrieve all chunks owned by owner_id."""
+        owner_str = normalize_owner_id(owner_id)
+        results = self.collection.get(
+            where={"owner_id": owner_str},
+            include=["documents", "metadatas"],
+        )
+        ids = results.get("ids") or []
+        if not ids:
+            return []
 
-        Args:
-            document_id: Identifier of the document to remove.
+        docs = results.get("documents") or []
+        metas = results.get("metadatas") or []
+        self._assert_records_owned(metas, owner_str, "get_owner_chunks")
 
-        Returns:
-            Number of chunks removed.
-        """
+        chunks: List[Dict[str, Any]] = []
+        for idx, chunk_id in enumerate(ids):
+            doc_text = docs[idx] if idx < len(docs) else ""
+            raw_meta = metas[idx] if idx < len(metas) else {}
+            deserialized_meta = self.deserialize_metadata(raw_meta)
+            chunks.append({
+                "chunk_id": chunk_id,
+                "document_id": deserialized_meta.get("document_id", ""),
+                "filename": deserialized_meta.get("filename", ""),
+                "text": doc_text,
+                "chunk_text": doc_text,
+                "metadata": deserialized_meta,
+            })
+        return chunks
+
+    def query_similar(
+        self,
+        query_embedding: List[float],
+        owner_id: Union[UUID, str],
+        top_k: int = 5,
+        document_id_filter: Optional[str] = None,
+        document_ids_filter: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Execute a mandatory owner-scoped ChromaDB similarity query."""
+        owner_str = normalize_owner_id(owner_id)
+        if top_k < 1:
+            raise ValueError(f"top_k must be >= 1, got {top_k}")
+
+        extra: Optional[Dict[str, Any]] = None
+        allowed_ids: Optional[List[str]] = None
+        if document_ids_filter is not None:
+            cleaned_ids = [str(d).strip() for d in document_ids_filter if str(d).strip()]
+            if cleaned_ids:
+                allowed_ids = list(dict.fromkeys(cleaned_ids))
+        if document_id_filter:
+            clean_single = str(document_id_filter).strip()
+            if clean_single:
+                if allowed_ids is not None:
+                    allowed_ids = [d for d in allowed_ids if d == clean_single]
+                    if not allowed_ids:
+                        return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
+                else:
+                    allowed_ids = [clean_single]
+
+        if allowed_ids is not None:
+            if len(allowed_ids) == 1:
+                extra = {"document_id": allowed_ids[0]}
+            else:
+                extra = {"document_id": {"$in": allowed_ids}}
+
+        where_clause = self._build_owner_where(owner_str, extra)
+
+        matching = self.collection.get(where=where_clause, include=[])
+        matching_ids = matching.get("ids") or []
+        if not matching_ids:
+            return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
+
+        effective_n_results = min(top_k, len(matching_ids))
+        results = self.collection.query(
+            query_embeddings=[query_embedding],
+            n_results=effective_n_results,
+            where=where_clause,
+            include=["documents", "metadatas", "distances"],
+        )
+
+        metas = (results.get("metadatas") or [[]])[0]
+        self._assert_records_owned(metas, owner_str, "query_similar")
+        return results
+
+    def delete_document(self, document_id: str, owner_id: Union[UUID, str]) -> int:
+        """Delete all chunks belonging to (owner_id, document_id) from ChromaDB."""
+        owner_str = normalize_owner_id(owner_id)
         if not document_id:
             return 0
 
+        where_clause = self._build_owner_where(owner_str, {"document_id": document_id})
         results = self.collection.get(
-            where={"document_id": document_id},
-            include=[],
+            where=where_clause,
+            include=["metadatas"],
         )
-
-        existing_ids = results.get("ids", [])
+        existing_ids = results.get("ids") or []
         if not existing_ids:
             return 0
 
-        self.collection.delete(where={"document_id": document_id})
+        self._assert_records_owned(results.get("metadatas") or [], owner_str, "delete_document")
+        self.collection.delete(where=where_clause)
         logger.info(
-            "Deleted document '%s' from ChromaDB (%d chunks removed, %d remaining)",
+            "Deleted document '%s' for owner '%s' from ChromaDB (%d chunks removed)",
             document_id,
+            owner_str,
             len(existing_ids),
-            self.collection.count(),
         )
         return len(existing_ids)
 
-    def get_unique_document_ids(self) -> Set[str]:
-        """Return the set of unique document_ids currently stored in the collection."""
-        all_records = self.collection.get(include=["metadatas"])
-        metadatas = all_records.get("metadatas", []) or []
-        doc_ids = set()
+    def get_unique_document_ids(self, owner_id: Union[UUID, str]) -> Set[str]:
+        """Return unique document_ids stored for the specified owner_id."""
+        owner_str = normalize_owner_id(owner_id)
+        records = self.collection.get(
+            where={"owner_id": owner_str},
+            include=["metadatas"],
+        )
+        metadatas = records.get("metadatas") or []
+        self._assert_records_owned(metadatas, owner_str, "get_unique_document_ids")
+
+        doc_ids: Set[str] = set()
         for m in metadatas:
             if m and "document_id" in m:
                 doc_ids.add(m["document_id"])
         return doc_ids
 
-    def get_statistics(self) -> Dict[str, Any]:
-        """Return comprehensive operational statistics for the vector store.
-
-        Returns:
-            Dictionary with collection metadata, counts, and directory paths.
-        """
-        unique_docs = self.get_unique_document_ids()
-        total_chunks = self.collection.count()
+    def get_statistics(self, owner_id: Optional[Union[UUID, str]] = None) -> Dict[str, Any]:
+        """Return vector store statistics. Document IDs are returned only when owner_id is supplied."""
+        if owner_id is not None:
+            owner_str = normalize_owner_id(owner_id)
+            unique_docs = self.get_unique_document_ids(owner_str)
+            total_chunks = self.count_for_owner(owner_str)
+            return {
+                "collection_name": self.collection_name,
+                "persist_directory": str(Path(self.persist_directory).resolve()),
+                "owner_id": owner_str,
+                "total_chunks": total_chunks,
+                "unique_documents_count": len(unique_docs),
+                "unique_document_ids": sorted(list(unique_docs)),
+                "distance_metric": "cosine",
+                "embedding_dimension": self.expected_dim,
+            }
 
         return {
             "collection_name": self.collection_name,
             "persist_directory": str(Path(self.persist_directory).resolve()),
-            "total_chunks": total_chunks,
-            "unique_documents_count": len(unique_docs),
-            "unique_document_ids": sorted(list(unique_docs)),
+            "total_chunks": self.collection.count(),
             "distance_metric": "cosine",
             "embedding_dimension": self.expected_dim,
         }

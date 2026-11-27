@@ -3,9 +3,11 @@
 from .client import get_chroma_client, reset_client_cache
 from .store import (
     ChromaVectorStore,
-    VectorStoreError,
     DocumentAlreadyExistsError,
+    TenantIsolationError,
+    VectorStoreError,
     VectorStoreInsertionError,
+    normalize_owner_id,
 )
 
 __all__ = [
@@ -15,4 +17,6 @@ __all__ = [
     "VectorStoreError",
     "DocumentAlreadyExistsError",
     "VectorStoreInsertionError",
+    "TenantIsolationError",
+    "normalize_owner_id",
 ]

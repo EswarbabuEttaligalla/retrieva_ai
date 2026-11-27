@@ -144,11 +144,16 @@ class TextChunker:
             if next_start <= start:
                 next_start = start + 1
 
-            # Adjust next_start forward to avoid cutting in the middle of a word if feasible
-            if next_start < end and not page_text[next_start].isspace():
-                # If preceding character is not whitespace, we might be inside a word
-                if next_start > 0 and not page_text[next_start - 1].isspace():
-                    # Look ahead for the next space to start at a clean word boundary
+            # Avoid starting the next chunk mid-table-row or mid-word
+            if next_start < end:
+                line_start = page_text.rfind("\n", start, next_start) + 1
+                if page_text[line_start:].lstrip().startswith("|"):
+                    next_nl = page_text.find("\n", next_start, end)
+                    if line_start > start:
+                        next_start = line_start
+                    elif next_nl != -1 and next_nl + 1 < end:
+                        next_start = next_nl + 1
+                elif not page_text[next_start].isspace() and next_start > 0 and not page_text[next_start - 1].isspace():
                     next_space = page_text.find(" ", next_start, end)
                     if next_space != -1 and next_space + 1 < end:
                         next_start = next_space + 1

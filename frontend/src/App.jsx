@@ -3,21 +3,25 @@ import Sidebar from './components/Sidebar';
 import ChatWorkspace from './components/ChatWorkspace';
 import CitationDrawer from './components/CitationDrawer';
 import RetrievalInspector from './components/RetrievalInspector';
-import { 
-  fetchHealth, 
-  fetchDocuments, 
-  uploadDocument, 
-  deleteDocument, 
-  askQuestion,
+import AuthScreen, { AuthLoadingScreen } from './components/AuthScreen';
+import { useAuth } from './context/AuthContext';
+import {
+  fetchHealth,
+  fetchDocuments,
+  uploadDocument,
+  deleteDocument,
   askQuestionStream,
   createConversation,
   fetchConversations,
   fetchConversation,
+  updateConversationTitle,
   deleteConversation,
 } from './api/client';
 import { Menu, X } from 'lucide-react';
 
-export default function App() {
+function AuthenticatedWorkspace({ user, onSignOut }) {
+  const ownerId = user.id;
+
   // Knowledge Base State
   const [documents, setDocuments] = useState([]);
   const [loadingDocs, setLoadingDocs] = useState(false);
@@ -35,59 +39,124 @@ export default function App() {
   // Multi-Turn Conversations State
   const [conversations, setConversations] = useState([]);
   const [currentConversationId, setCurrentConversationId] = useState(null);
-  const [loadingConversations, setLoadingConversations] = useState(false);
 
-  // Citation Drawer State
+  // Citation Drawer & Retrieval Inspector State
   const [activeCitation, setActiveCitation] = useState(null);
   const [isCitationDrawerOpen, setIsCitationDrawerOpen] = useState(false);
-
-  // Retrieval Inspector State
   const [isRetrievalInspectorOpen, setIsRetrievalInspectorOpen] = useState(false);
 
   // Mobile sidebar toggle
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
 
-  // AbortController ref for in-flight streaming
+  // Abort & ownership guards preventing stale User A responses from mutating User B state
+  const activeOwnerRef = useRef(ownerId);
+  const mountedRef = useRef(true);
   const abortControllerRef = useRef(null);
+  const docsAbortRef = useRef(null);
+  const convsAbortRef = useRef(null);
+  const detailAbortRef = useRef(null);
+  const uploadAbortRef = useRef(null);
+
+  const isCurrentSession = useCallback(
+    (expectedOwnerId) => mountedRef.current && activeOwnerRef.current === expectedOwnerId,
+    []
+  );
+
+  const abortAllInFlightRequests = useCallback(() => {
+    for (const ref of [
+      abortControllerRef,
+      docsAbortRef,
+      convsAbortRef,
+      detailAbortRef,
+      uploadAbortRef,
+    ]) {
+      if (ref.current) {
+        ref.current.abort();
+        ref.current = null;
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    activeOwnerRef.current = ownerId;
+    return () => {
+      mountedRef.current = false;
+      abortAllInFlightRequests();
+    };
+  }, [ownerId, abortAllInFlightRequests]);
 
   // Probe Backend Health
   const checkHealth = useCallback(async () => {
+    const requestOwnerId = ownerId;
     try {
       await fetchHealth();
-      setBackendLive(true);
+      if (isCurrentSession(requestOwnerId)) {
+        setBackendLive(true);
+      }
     } catch {
-      setBackendLive(false);
+      if (isCurrentSession(requestOwnerId)) {
+        setBackendLive(false);
+      }
     }
-  }, []);
+  }, [ownerId, isCurrentSession]);
 
-  // Load Documents from Backend
+  // Load Documents for Authenticated User
   const loadDocuments = useCallback(async () => {
+    const requestOwnerId = ownerId;
+    if (docsAbortRef.current) {
+      docsAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    docsAbortRef.current = controller;
+
     setLoadingDocs(true);
     try {
-      const res = await fetchDocuments();
+      const res = await fetchDocuments({ signal: controller.signal });
+      if (!isCurrentSession(requestOwnerId) || controller.signal.aborted) return;
       setDocuments(res.documents || []);
       setBackendLive(true);
     } catch (err) {
-      console.warn('Failed to load documents:', err.message);
+      if (err?.name === 'AbortError' || controller.signal.aborted) return;
+      if (isCurrentSession(requestOwnerId)) {
+        console.warn('Failed to load documents:', err.message);
+      }
     } finally {
-      setLoadingDocs(false);
+      if (docsAbortRef.current === controller) {
+        docsAbortRef.current = null;
+      }
+      if (isCurrentSession(requestOwnerId)) {
+        setLoadingDocs(false);
+      }
     }
-  }, []);
+  }, [ownerId, isCurrentSession]);
 
-  // Load Persistent Conversations
+  // Load Persistent Conversations for Authenticated User
   const loadConversations = useCallback(async () => {
-    setLoadingConversations(true);
+    const requestOwnerId = ownerId;
+    if (convsAbortRef.current) {
+      convsAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    convsAbortRef.current = controller;
+
     try {
-      const res = await fetchConversations();
+      const res = await fetchConversations(50, 0, { signal: controller.signal });
+      if (!isCurrentSession(requestOwnerId) || controller.signal.aborted) return;
       setConversations(res || []);
     } catch (err) {
-      console.warn('Failed to load conversations:', err.message);
+      if (err?.name === 'AbortError' || controller.signal.aborted) return;
+      if (isCurrentSession(requestOwnerId)) {
+        console.warn('Failed to load conversations:', err.message);
+      }
     } finally {
-      setLoadingConversations(false);
+      if (convsAbortRef.current === controller) {
+        convsAbortRef.current = null;
+      }
     }
-  }, []);
+  }, [ownerId, isCurrentSession]);
 
-  // Initial load
+  // Initial authenticated load
   useEffect(() => {
     checkHealth();
     loadDocuments();
@@ -96,38 +165,76 @@ export default function App() {
     return () => clearInterval(interval);
   }, [checkHealth, loadDocuments, loadConversations]);
 
+  // Explicit Logout with complete state teardown
+  const handleSignOut = async () => {
+    abortAllInFlightRequests();
+    setDocuments([]);
+    setSelectedDocIds([]);
+    setConversations([]);
+    setCurrentConversationId(null);
+    setMessages([]);
+    setActiveCitation(null);
+    setIsCitationDrawerOpen(false);
+    setIsRetrievalInspectorOpen(false);
+    setQueryError(null);
+    setStreamingStatus(null);
+    setQueryLoading(false);
+    setUploading(false);
+    await onSignOut();
+  };
+
   // Select active conversation and load message history
   const handleSelectConversation = async (convId) => {
+    const requestOwnerId = ownerId;
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
     }
+    if (detailAbortRef.current) {
+      detailAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    detailAbortRef.current = controller;
+
     setQueryLoading(false);
     setStreamingStatus(null);
     setQueryError(null);
     setCurrentConversationId(convId);
 
     try {
-      const detail = await fetchConversation(convId);
+      const detail = await fetchConversation(convId, { signal: controller.signal });
+      if (!isCurrentSession(requestOwnerId) || controller.signal.aborted) return;
+
       const loadedMessages = (detail.messages || []).map((msg) => {
         const metadata = msg.metadata || {};
+        const resolvedCitations =
+          Array.isArray(msg.citations) && msg.citations.length > 0
+            ? msg.citations
+            : metadata.citations || [];
         return {
           id: msg.id,
           role: msg.role,
           content: msg.content,
           raw_query: msg.raw_query,
           rewritten_query: msg.rewritten_query,
-          citations: metadata.citations || [],
+          citations: resolvedCitations,
           insufficient_context: Boolean(metadata.insufficient_context),
           isVerified: msg.role === 'assistant',
           isStreaming: false,
-          metadata: metadata,
+          metadata,
           timestamp: msg.created_at,
         };
       });
       setMessages(loadedMessages);
     } catch (err) {
-      setQueryError(`Failed to load conversation history: ${err.message}`);
+      if (err?.name === 'AbortError' || controller.signal.aborted) return;
+      if (isCurrentSession(requestOwnerId)) {
+        setQueryError(`Failed to load conversation history: ${err.message}`);
+      }
+    } finally {
+      if (detailAbortRef.current === controller) {
+        detailAbortRef.current = null;
+      }
     }
   };
 
@@ -144,59 +251,91 @@ export default function App() {
     setMessages([]);
   };
 
-  // Delete a conversation
+  // Rename an owned conversation
+  const handleRenameConversation = async (convId, newTitle) => {
+    const requestOwnerId = ownerId;
+    await updateConversationTitle(convId, newTitle);
+    if (isCurrentSession(requestOwnerId)) {
+      await loadConversations();
+    }
+  };
+
+  // Delete an owned conversation
   const handleDeleteConversation = async (convId) => {
+    const requestOwnerId = ownerId;
     try {
       await deleteConversation(convId);
+      if (!isCurrentSession(requestOwnerId)) return;
       if (currentConversationId === convId) {
         handleNewChat();
       }
       await loadConversations();
     } catch (err) {
-      setQueryError(`Failed to delete conversation: ${err.message}`);
+      if (isCurrentSession(requestOwnerId)) {
+        setQueryError(`Failed to delete conversation: ${err.message}`);
+      }
     }
   };
 
   // Handle Document Upload
   const handleUpload = async (file) => {
+    const requestOwnerId = ownerId;
+    if (uploadAbortRef.current) {
+      uploadAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    uploadAbortRef.current = controller;
+
     setUploading(true);
     try {
-      const res = await uploadDocument(file);
+      const res = await uploadDocument(file, { signal: controller.signal });
+      if (!isCurrentSession(requestOwnerId) || controller.signal.aborted) {
+        return res;
+      }
       await loadDocuments();
       return res;
     } finally {
-      setUploading(false);
+      if (uploadAbortRef.current === controller) {
+        uploadAbortRef.current = null;
+      }
+      if (isCurrentSession(requestOwnerId)) {
+        setUploading(false);
+      }
     }
   };
 
   // Handle Document Delete
   const handleDelete = async (docId) => {
+    const requestOwnerId = ownerId;
     await deleteDocument(docId);
-    // If the deleted document was in selectedDocIds, remove it
+    if (!isCurrentSession(requestOwnerId)) return;
     setSelectedDocIds((prev) => prev.filter((id) => id !== docId));
     await loadDocuments();
   };
 
   // Handle Question Submission via SSE Real-Time Streaming
   const handleSubmitQuestion = async (queryText) => {
+    const requestOwnerId = ownerId;
     setQueryError(null);
     setStreamingStatus('Searching the knowledge base...');
 
-    // Abort any previous pending stream
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
     }
 
-    // Auto-create conversation if not currently in an active session
     let activeConvId = currentConversationId;
     if (!activeConvId) {
       try {
         const created = await createConversation({ title: queryText.slice(0, 40) });
+        if (!isCurrentSession(requestOwnerId)) return;
         activeConvId = created.id;
         setCurrentConversationId(created.id);
       } catch (convErr) {
-        console.warn('Failed to auto-create conversation:', convErr);
+        if (!isCurrentSession(requestOwnerId)) return;
+        setStreamingStatus(null);
+        setQueryError(convErr.message || 'Failed to start conversation.');
+        return;
       }
     }
 
@@ -234,11 +373,12 @@ export default function App() {
       await askQuestionStream({
         query: queryText,
         retrieval_mode: retrievalMode,
-        top_k: 5,
+        top_k: 7,
         document_ids: docFilter,
         conversation_id: activeConvId,
         signal: controller.signal,
         onStatus: (statusPayload) => {
+          if (!isCurrentSession(requestOwnerId)) return;
           setStreamingStatus(statusPayload.message);
           setMessages((prev) =>
             prev.map((msg) =>
@@ -253,6 +393,7 @@ export default function App() {
           );
         },
         onToken: (tokenDelta) => {
+          if (!isCurrentSession(requestOwnerId)) return;
           setMessages((prev) =>
             prev.map((msg) =>
               msg.id === assistantMsgId
@@ -265,6 +406,7 @@ export default function App() {
           );
         },
         onCitations: (citationsPayload) => {
+          if (!isCurrentSession(requestOwnerId)) return;
           setMessages((prev) =>
             prev.map((msg) =>
               msg.id === assistantMsgId
@@ -282,6 +424,7 @@ export default function App() {
           );
         },
         onRejection: (rejectionPayload) => {
+          if (!isCurrentSession(requestOwnerId)) return;
           setMessages((prev) =>
             prev.map((msg) =>
               msg.id === assistantMsgId
@@ -302,6 +445,7 @@ export default function App() {
           loadConversations();
         },
         onError: (errorPayload) => {
+          if (!isCurrentSession(requestOwnerId)) return;
           setQueryError(errorPayload.message || 'Error during streaming generation.');
           setMessages((prev) =>
             prev.map((msg) =>
@@ -315,6 +459,7 @@ export default function App() {
           );
         },
         onDone: () => {
+          if (!isCurrentSession(requestOwnerId)) return;
           setQueryLoading(false);
           setStreamingStatus(null);
           setMessages((prev) =>
@@ -331,15 +476,17 @@ export default function App() {
         },
       });
     } catch (err) {
-      if (controller.signal.aborted) {
+      if (controller.signal.aborted || !isCurrentSession(requestOwnerId)) {
         return;
       }
       setQueryError(err.message || 'An error occurred while answering your question.');
     } finally {
-      setQueryLoading(false);
-      setStreamingStatus(null);
       if (abortControllerRef.current === controller) {
         abortControllerRef.current = null;
+      }
+      if (isCurrentSession(requestOwnerId)) {
+        setQueryLoading(false);
+        setStreamingStatus(null);
       }
     }
   };
@@ -377,7 +524,7 @@ export default function App() {
 
   // Toggle selection filter for document
   const handleToggleDocSelection = (docId) => {
-    setSelectedDocIds((prev) => 
+    setSelectedDocIds((prev) =>
       prev.includes(docId) ? prev.filter((id) => id !== docId) : [...prev, docId]
     );
   };
@@ -396,9 +543,11 @@ export default function App() {
       </div>
 
       {/* Sidebar (Desktop & Mobile Drawer) */}
-      <div className={`fixed md:relative inset-y-0 left-0 z-30 transition-transform duration-300 md:translate-x-0 ${
-        mobileSidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'
-      }`}>
+      <div
+        className={`fixed md:relative inset-y-0 left-0 z-30 transition-transform duration-300 md:translate-x-0 ${
+          mobileSidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'
+        }`}
+      >
         <Sidebar
           documents={documents}
           loading={loadingDocs}
@@ -414,6 +563,9 @@ export default function App() {
           onSelectConversation={handleSelectConversation}
           onNewChat={handleNewChat}
           onDeleteConversation={handleDeleteConversation}
+          onRenameConversation={handleRenameConversation}
+          userEmail={user.email}
+          onSignOut={handleSignOut}
         />
       </div>
 
@@ -453,10 +605,34 @@ export default function App() {
 
       {/* Standalone Retrieval Inspector */}
       <RetrievalInspector
+        key={ownerId}
         isOpen={isRetrievalInspectorOpen}
         onClose={() => setIsRetrievalInspectorOpen(false)}
         documents={documents}
       />
     </div>
   );
+}
+
+export default function App() {
+  const { user, loading, authError, clearAuthError, isConfigured, signIn, signUp, signOut } =
+    useAuth();
+
+  if (loading) {
+    return <AuthLoadingScreen />;
+  }
+
+  if (!user) {
+    return (
+      <AuthScreen
+        onSignIn={signIn}
+        onSignUp={signUp}
+        authError={authError}
+        onClearError={clearAuthError}
+        isConfigured={isConfigured}
+      />
+    );
+  }
+
+  return <AuthenticatedWorkspace key={user.id} user={user} onSignOut={signOut} />;
 }

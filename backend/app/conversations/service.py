@@ -1,8 +1,10 @@
-"""Service layer coordinating conversation persistence, history management, and query rewriting."""
+"""Service layer coordinating Supabase-backed conversation persistence, history, and query rewriting."""
 
-import asyncio
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
+from uuid import UUID
+
+from fastapi import Depends
 
 from backend.app.conversations.models import (
     ConversationDetail,
@@ -13,96 +15,189 @@ from backend.app.conversations.query_rewriter import (
     ConversationalQueryRewriter,
     get_query_rewriter,
 )
-from backend.app.conversations.repository import (
-    ConversationRepository,
-    get_conversation_repository,
-)
 from backend.app.core.config import get_settings
+from backend.app.repositories.conversation_repository import (
+    SupabaseConversationRecord,
+    SupabaseConversationRepository,
+    get_supabase_conversation_repository,
+)
+from backend.app.repositories.message_repository import (
+    SupabaseMessageRecord,
+    SupabaseMessageRepository,
+    get_message_repository,
+)
 
 logger = logging.getLogger("retrieva_ai.conversations.service")
 
 
 class ConversationNotFoundError(Exception):
-    """Raised when an operation targets an uncataloged conversation ID."""
-    pass
+    """Raised when an operation targets a missing, malformed, or unowned conversation ID."""
+
+
+def _normalize_uuid(value: Union[UUID, str]) -> Optional[UUID]:
+    if isinstance(value, UUID):
+        return value
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return UUID(raw)
+    except ValueError:
+        return None
+
+
+def _to_conversation_record(
+    rec: SupabaseConversationRecord,
+    message_count: int = 0,
+) -> ConversationRecord:
+    return ConversationRecord(
+        id=str(rec.id),
+        title=rec.title,
+        created_at=rec.created_at.isoformat(),
+        updated_at=rec.updated_at.isoformat(),
+        message_count=message_count,
+    )
+
+
+def _to_message_record(rec: SupabaseMessageRecord) -> MessageRecord:
+    meta = dict(rec.metadata) if rec.metadata else {}
+    if rec.citations and "citations" not in meta:
+        meta["citations"] = list(rec.citations)
+    return MessageRecord(
+        id=str(rec.id),
+        conversation_id=str(rec.conversation_id),
+        role=rec.role,
+        content=rec.content,
+        raw_query=rec.raw_query,
+        rewritten_query=rec.rewritten_query,
+        created_at=rec.created_at.isoformat(),
+        metadata=meta or None,
+        citations=list(rec.citations),
+    )
 
 
 class ConversationService:
-    """Coordinates conversation lifecycle, multi-turn message storage, and contextual query rewriting."""
+    """Owner-scoped, Supabase-backed conversation lifecycle, history, and query rewriting service."""
 
     def __init__(
         self,
-        repository: Optional[ConversationRepository] = None,
+        conversation_repo: SupabaseConversationRepository,
+        message_repo: SupabaseMessageRepository,
         query_rewriter: Optional[ConversationalQueryRewriter] = None,
-    ):
-        self.repository = repository or get_conversation_repository()
+    ) -> None:
+        self.conversation_repo = conversation_repo
+        self.message_repo = message_repo
         self.query_rewriter = query_rewriter or get_query_rewriter()
 
-    def create_conversation(self, title: Optional[str] = None) -> ConversationRecord:
-        """Create a new conversation session."""
-        return self.repository.create_conversation(title=title)
+    @staticmethod
+    def _require_owner_uuid(owner_id: Union[UUID, str]) -> UUID:
+        parsed = _normalize_uuid(owner_id)
+        if parsed is None:
+            raise ValueError("A valid UUID owner_id is required for conversation operations.")
+        return parsed
 
-    async def create_conversation_async(self, title: Optional[str] = None) -> ConversationRecord:
-        """Create a new conversation session asynchronously."""
-        return await asyncio.to_thread(self.create_conversation, title)
+    async def create_conversation(
+        self,
+        owner_id: Union[UUID, str],
+        title: Optional[str] = None,
+    ) -> ConversationRecord:
+        """Create a new persistent conversation owned by owner_id in Supabase."""
+        owner_uuid = self._require_owner_uuid(owner_id)
+        created = await self.conversation_repo.create_conversation(owner_id=owner_uuid, title=title)
+        return _to_conversation_record(created, message_count=0)
 
-    def list_conversations(self, limit: int = 50, offset: int = 0) -> List[ConversationRecord]:
-        """List persistent conversations ordered by most recently updated."""
-        return self.repository.list_conversations(limit=limit, offset=offset)
+    async def list_conversations(
+        self,
+        owner_id: Union[UUID, str],
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[ConversationRecord]:
+        """List persistent conversations belonging exclusively to owner_id."""
+        owner_uuid = self._require_owner_uuid(owner_id)
+        rows = await self.conversation_repo.list_conversations(
+            owner_id=owner_uuid,
+            limit=limit,
+            offset=offset,
+        )
+        return [_to_conversation_record(row) for row in rows]
 
-    async def list_conversations_async(self, limit: int = 50, offset: int = 0) -> List[ConversationRecord]:
-        """List persistent conversations asynchronously."""
-        return await asyncio.to_thread(self.list_conversations, limit, offset)
-
-    def get_conversation(self, conversation_id: str) -> Optional[ConversationRecord]:
-        """Fetch metadata for a single conversation."""
-        return self.repository.get_conversation(conversation_id)
-
-    async def get_conversation_async(self, conversation_id: str) -> Optional[ConversationRecord]:
-        """Fetch metadata for a single conversation asynchronously."""
-        return await asyncio.to_thread(self.get_conversation, conversation_id)
-
-    def get_conversation_with_messages(self, conversation_id: str) -> Optional[ConversationDetail]:
-        """Fetch conversation details including full chronological message history."""
-        conv = self.repository.get_conversation(conversation_id)
-        if not conv:
+    async def get_conversation(
+        self,
+        conversation_id: str,
+        owner_id: Union[UUID, str],
+    ) -> Optional[ConversationRecord]:
+        """Fetch metadata for an owned conversation; returns None if missing, invalid, or foreign."""
+        owner_uuid = self._require_owner_uuid(owner_id)
+        conv_uuid = _normalize_uuid(conversation_id)
+        if conv_uuid is None:
             return None
-        messages = self.repository.get_messages(conversation_id)
+        row = await self.conversation_repo.get_conversation(conversation_id=conv_uuid, owner_id=owner_uuid)
+        if row is None:
+            return None
+        return _to_conversation_record(row)
+
+    async def get_conversation_with_messages(
+        self,
+        conversation_id: str,
+        owner_id: Union[UUID, str],
+    ) -> Optional[ConversationDetail]:
+        """Fetch an owned conversation and its full chronological message history."""
+        owner_uuid = self._require_owner_uuid(owner_id)
+        conv_uuid = _normalize_uuid(conversation_id)
+        if conv_uuid is None:
+            return None
+        conv = await self.conversation_repo.get_conversation(conversation_id=conv_uuid, owner_id=owner_uuid)
+        if conv is None:
+            return None
+        msg_rows = await self.message_repo.list_messages(conversation_id=conv_uuid, owner_id=owner_uuid)
         return ConversationDetail(
-            id=conv.id,
+            id=str(conv.id),
             title=conv.title,
-            created_at=conv.created_at,
-            updated_at=conv.updated_at,
-            messages=messages,
+            created_at=conv.created_at.isoformat(),
+            updated_at=conv.updated_at.isoformat(),
+            messages=[_to_message_record(m) for m in msg_rows],
         )
 
-    async def get_conversation_with_messages_async(self, conversation_id: str) -> Optional[ConversationDetail]:
-        """Fetch conversation details including full chronological message history asynchronously."""
-        return await asyncio.to_thread(self.get_conversation_with_messages, conversation_id)
+    async def update_conversation_title(
+        self,
+        conversation_id: str,
+        owner_id: Union[UUID, str],
+        title: str,
+    ) -> ConversationRecord:
+        """Rename an owned conversation; raises ConversationNotFoundError if missing or foreign."""
+        owner_uuid = self._require_owner_uuid(owner_id)
+        conv_uuid = _normalize_uuid(conversation_id)
+        if conv_uuid is None:
+            raise ConversationNotFoundError("Conversation not found.")
+        updated = await self.conversation_repo.update_conversation_title(
+            conversation_id=conv_uuid,
+            owner_id=owner_uuid,
+            title=title,
+        )
+        if updated is None:
+            raise ConversationNotFoundError("Conversation not found.")
+        return _to_conversation_record(updated)
 
-    def update_conversation_title(self, conversation_id: str, title: str) -> bool:
-        """Update conversation title."""
-        conv = self.repository.get_conversation(conversation_id)
-        if not conv:
-            raise ConversationNotFoundError(f"Conversation '{conversation_id}' not found.")
-        return self.repository.update_conversation(conversation_id, title=title)
-
-    async def update_conversation_title_async(self, conversation_id: str, title: str) -> bool:
-        """Update conversation title asynchronously."""
-        return await asyncio.to_thread(self.update_conversation_title, conversation_id, title)
-
-    def delete_conversation(self, conversation_id: str) -> bool:
-        """Delete conversation and its associated messages."""
-        deleted = self.repository.delete_conversation(conversation_id)
+    async def delete_conversation(
+        self,
+        conversation_id: str,
+        owner_id: Union[UUID, str],
+    ) -> bool:
+        """Delete an owned conversation; raises ConversationNotFoundError if missing or foreign."""
+        owner_uuid = self._require_owner_uuid(owner_id)
+        conv_uuid = _normalize_uuid(conversation_id)
+        if conv_uuid is None:
+            raise ConversationNotFoundError("Conversation not found.")
+        deleted = await self.conversation_repo.delete_conversation(
+            conversation_id=conv_uuid,
+            owner_id=owner_uuid,
+        )
         if not deleted:
-            raise ConversationNotFoundError(f"Conversation '{conversation_id}' not found.")
+            raise ConversationNotFoundError("Conversation not found.")
         return True
 
-    async def delete_conversation_async(self, conversation_id: str) -> bool:
-        """Delete conversation and its associated messages asynchronously."""
-        return await asyncio.to_thread(self.delete_conversation, conversation_id)
-
-    def _generate_title_from_query(self, query: str) -> str:
+    @staticmethod
+    def _generate_title_from_query(query: str) -> str:
         """Derive a clean, concise conversation title from the initial user query."""
         clean = " ".join(query.strip().split())
         if len(clean) > 50:
@@ -110,132 +205,122 @@ class ConversationService:
             return truncated if truncated else clean[:50]
         return clean or "New Conversation"
 
-    def record_user_message(
-        self,
-        conversation_id: str,
-        raw_query: str,
-        rewritten_query: str,
-    ) -> MessageRecord:
-        """Persist a user turn and automatically derive title if conversation is new."""
-        conv = self.repository.get_conversation(conversation_id)
-        if not conv:
-            raise ConversationNotFoundError(f"Conversation '{conversation_id}' not found.")
-
-        # If the conversation has a default placeholder title, derive title from first question
-        if conv.title == "New Conversation" or not conv.title.strip():
-            derived_title = self._generate_title_from_query(raw_query)
-            self.repository.update_conversation(conversation_id, title=derived_title)
-
-        return self.repository.add_message(
-            conversation_id=conversation_id,
-            role="user",
-            content=raw_query,
-            raw_query=raw_query,
-            rewritten_query=rewritten_query,
-        )
-
-    async def record_user_message_async(
-        self,
-        conversation_id: str,
-        raw_query: str,
-        rewritten_query: str,
-    ) -> MessageRecord:
-        """Persist a user turn asynchronously in a worker thread."""
-        return await asyncio.to_thread(
-            self.record_user_message,
-            conversation_id,
-            raw_query,
-            rewritten_query,
-        )
-
-    def record_assistant_message(
-        self,
-        conversation_id: str,
-        content: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> MessageRecord:
-        """Persist a verified assistant response turn with citation and diagnostic metadata."""
-        conv = self.repository.get_conversation(conversation_id)
-        if not conv:
-            raise ConversationNotFoundError(f"Conversation '{conversation_id}' not found.")
-
-        return self.repository.add_message(
-            conversation_id=conversation_id,
-            role="assistant",
-            content=content,
-            metadata=metadata,
-        )
-
-    async def record_assistant_message_async(
-        self,
-        conversation_id: str,
-        content: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> MessageRecord:
-        """Persist a verified assistant response turn asynchronously in a worker thread."""
-        return await asyncio.to_thread(
-            self.record_assistant_message,
-            conversation_id,
-            content,
-            metadata,
-        )
-
     async def prepare_conversational_turn(
         self,
         conversation_id: str,
+        owner_id: Union[UUID, str],
         raw_query: str,
     ) -> Tuple[str, List[MessageRecord]]:
-        """Validate conversation existence, retrieve history, and rewrite follow-up query asynchronously."""
-        conv = await self.get_conversation_async(conversation_id)
-        if not conv:
-            raise ConversationNotFoundError(f"Conversation '{conversation_id}' not found.")
+        """Verify ownership, load bounded recent history for this owner, and rewrite follow-up query."""
+        owner_uuid = self._require_owner_uuid(owner_id)
+        conv_uuid = _normalize_uuid(conversation_id)
+        if conv_uuid is None:
+            raise ConversationNotFoundError("Conversation not found.")
+
+        conv = await self.conversation_repo.get_conversation(conversation_id=conv_uuid, owner_id=owner_uuid)
+        if conv is None:
+            raise ConversationNotFoundError("Conversation not found.")
 
         settings = get_settings()
-        history = await asyncio.to_thread(
-            self.repository.get_recent_history,
-            conversation_id,
-            settings.CONVERSATION_HISTORY_WINDOW,
+        recent_rows = await self.message_repo.get_recent_history(
+            conversation_id=conv_uuid,
+            owner_id=owner_uuid,
+            window=settings.CONVERSATION_HISTORY_WINDOW,
         )
+        history = [_to_message_record(m) for m in recent_rows]
 
         rewritten_query = await self.query_rewriter.rewrite_async(
             raw_query=raw_query,
             history=history,
             window=settings.CONVERSATION_HISTORY_WINDOW,
         )
-
         return rewritten_query, history
 
-    def prepare_conversational_turn_sync(
+    async def record_user_message(
         self,
         conversation_id: str,
+        owner_id: Union[UUID, str],
         raw_query: str,
-    ) -> Tuple[str, List[MessageRecord]]:
-        """Validate conversation existence, retrieve history, and rewrite follow-up query synchronously."""
-        conv = self.repository.get_conversation(conversation_id)
-        if not conv:
-            raise ConversationNotFoundError(f"Conversation '{conversation_id}' not found.")
+        rewritten_query: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> MessageRecord:
+        """Persist an owned user turn, auto-title new conversations, and advance updated_at."""
+        owner_uuid = self._require_owner_uuid(owner_id)
+        conv_uuid = _normalize_uuid(conversation_id)
+        if conv_uuid is None:
+            raise ConversationNotFoundError("Conversation not found.")
 
-        settings = get_settings()
-        history = self.repository.get_recent_history(
-            conversation_id,
-            window=settings.CONVERSATION_HISTORY_WINDOW,
-        )
+        conv = await self.conversation_repo.get_conversation(conversation_id=conv_uuid, owner_id=owner_uuid)
+        if conv is None:
+            raise ConversationNotFoundError("Conversation not found.")
 
-        rewritten_query = self.query_rewriter.rewrite(
+        inserted = await self.message_repo.insert_user_message(
+            conversation_id=conv_uuid,
+            owner_id=owner_uuid,
+            content=raw_query,
             raw_query=raw_query,
-            history=history,
-            window=settings.CONVERSATION_HISTORY_WINDOW,
+            rewritten_query=rewritten_query,
+            metadata=metadata,
         )
 
-        return rewritten_query, history
+        # Auto-title if default placeholder, otherwise touch title to advance conversations.updated_at
+        if conv.title == "New Conversation" or not conv.title.strip():
+            target_title = self._generate_title_from_query(raw_query)
+            await self.conversation_repo.update_conversation_title(
+                conversation_id=conv_uuid,
+                owner_id=owner_uuid,
+                title=target_title,
+            )
+        else:
+            await self.conversation_repo.touch_conversation(
+                conversation_id=conv_uuid,
+                owner_id=owner_uuid,
+                title=conv.title,
+            )
+
+        return _to_message_record(inserted)
+
+    async def record_assistant_message(
+        self,
+        conversation_id: str,
+        owner_id: Union[UUID, str],
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        citations: Optional[List[Dict[str, Any]]] = None,
+    ) -> MessageRecord:
+        """Persist a verified assistant response via the owner-scoped Supabase RPC."""
+        owner_uuid = self._require_owner_uuid(owner_id)
+        conv_uuid = _normalize_uuid(conversation_id)
+        if conv_uuid is None:
+            raise ConversationNotFoundError("Conversation not found.")
+
+        conv = await self.conversation_repo.get_conversation(conversation_id=conv_uuid, owner_id=owner_uuid)
+        if conv is None:
+            raise ConversationNotFoundError("Conversation not found.")
+
+        meta_payload = dict(metadata) if metadata is not None else {}
+        resolved_citations = list(citations) if citations is not None else list(meta_payload.get("citations") or [])
+        if resolved_citations and "citations" not in meta_payload:
+            meta_payload["citations"] = resolved_citations
+
+        inserted = await self.message_repo.insert_assistant_message(
+            conversation_id=conv_uuid,
+            owner_id=owner_uuid,
+            content=content,
+            metadata=meta_payload,
+            citations=resolved_citations,
+        )
+        return _to_message_record(inserted)
 
 
-_service_instance: Optional[ConversationService] = None
-
-
-def get_conversation_service() -> ConversationService:
-    """Return singleton instance of ConversationService."""
-    global _service_instance
-    if _service_instance is None:
-        _service_instance = ConversationService()
-    return _service_instance
+def get_conversation_service(
+    conversation_repo: SupabaseConversationRepository = Depends(get_supabase_conversation_repository),
+    message_repo: SupabaseMessageRepository = Depends(get_message_repository),
+    query_rewriter: ConversationalQueryRewriter = Depends(get_query_rewriter),
+) -> ConversationService:
+    """FastAPI dependency constructing a request-scoped Supabase-backed ConversationService."""
+    return ConversationService(
+        conversation_repo=conversation_repo,
+        message_repo=message_repo,
+        query_rewriter=query_rewriter,
+    )

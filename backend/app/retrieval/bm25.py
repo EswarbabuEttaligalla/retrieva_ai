@@ -245,24 +245,59 @@ class BM25Index:
 
         return score
 
+    def get_statistics(self) -> Dict[str, Any]:
+        """Return corpus statistics strictly for this BM25Index instance."""
+        unique_docs = {
+            c.get("document_id") or c.get("metadata", {}).get("document_id")
+            for c in self.corpus_chunks.values()
+        }
+        unique_docs.discard(None)
+        unique_docs.discard("")
+        return {
+            "chunk_count": self.doc_count,
+            "unique_document_count": len(unique_docs),
+            "total_tokens": self.total_tokens,
+            "avg_doc_len": round(self.avg_doc_len, 4),
+            "vocabulary_size": len(self.doc_frequencies),
+            "k1": self.k1,
+            "b": self.b,
+        }
+
     def search(
         self,
         query: str,
         top_k: int = 5,
         document_id_filter: Optional[str] = None,
+        document_ids_filter: Optional[List[str]] = None,
     ) -> List[RetrievedChunk]:
         """Execute BM25 keyword search over indexed chunks.
 
         Args:
             query: Natural language query string.
             top_k: Maximum number of ranked results to return.
-            document_id_filter: Optional document ID to filter candidates.
+            document_id_filter: Optional single document ID to filter candidates.
+            document_ids_filter: Optional list of document IDs to filter candidates.
 
         Returns:
             Ranked list of RetrievedChunk objects sorted descending by bm25_score.
         """
         if not query or not query.strip() or self.doc_count == 0 or top_k <= 0:
             return []
+
+        allowed_doc_ids: Optional[Set[str]] = None
+        if document_ids_filter is not None:
+            cleaned_ids = {str(d).strip() for d in document_ids_filter if str(d).strip()}
+            if cleaned_ids:
+                allowed_doc_ids = cleaned_ids
+        if document_id_filter:
+            clean_single = str(document_id_filter).strip()
+            if clean_single:
+                if allowed_doc_ids is not None:
+                    allowed_doc_ids = allowed_doc_ids & {clean_single}
+                    if not allowed_doc_ids:
+                        return []
+                else:
+                    allowed_doc_ids = {clean_single}
 
         query_tokens = tokenize_text(query)
         if not query_tokens:
@@ -283,7 +318,7 @@ class BM25Index:
             chunk_meta = self.corpus_chunks[chunk_id]
             doc_id = chunk_meta.get("document_id") or chunk_meta.get("metadata", {}).get("document_id")
 
-            if document_id_filter and doc_id != document_id_filter:
+            if allowed_doc_ids is not None and doc_id not in allowed_doc_ids:
                 continue
 
             score = self.score_chunk(query_tokens, chunk_id)

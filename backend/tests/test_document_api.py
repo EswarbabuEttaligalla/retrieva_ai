@@ -13,16 +13,122 @@ Covers:
 
 import codecs
 import io
+import json
+from datetime import datetime, timezone
 from unittest.mock import patch
+from urllib.parse import parse_qs
+from uuid import UUID, uuid4
 import fitz  # PyMuPDF
+import httpx
 import pytest
 from starlette.testclient import TestClient
 
 from backend.app.core.config import get_settings
+from backend.app.core.supabase_client import SupabaseClient
 from backend.app.document_processing.identifier import global_document_registry
+from backend.app.main import app
+from backend.app.repositories.document_repository import DocumentRepository, get_document_repository
+from backend.app.repositories.storage_repository import SupabaseStorageRepository, get_storage_repository
 from backend.app.retrieval.retriever import get_retriever
 from backend.app.schemas.retrieval import RetrievalConfiguration, RetrievalMode, RetrievalRequest
 from backend.app.services.ingestion_service import get_ingestion_service
+
+TEST_OWNER_ID = UUID("11111111-1111-4111-8111-111111111111")
+TEST_SUPABASE_URL = "https://zblfcosunplvnnwjfyjz.supabase.co"
+
+
+class InMemorySupabaseMock:
+    """In-memory Supabase PostgREST + Storage simulator for document API integration tests."""
+
+    def __init__(self) -> None:
+        self.documents = {}
+        self.storage_objects = {}
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        now = datetime.now(timezone.utc).isoformat()
+        qs = parse_qs(request.url.query.decode("utf-8")) if request.url.query else {}
+
+        # Storage endpoints
+        if path.startswith("/storage/v1/object/authenticated/retrieva-user-documents/"):
+            obj_path = path.split("/retrieva-user-documents/", 1)[1]
+            if request.method == "GET":
+                obj = self.storage_objects.get(obj_path)
+                if not obj:
+                    return httpx.Response(404, json={"message": "Object not found"})
+                return httpx.Response(200, content=obj["bytes"])
+
+        if path.startswith("/storage/v1/object/retrieva-user-documents/"):
+            obj_path = path.split("/retrieva-user-documents/", 1)[1]
+            if request.method == "POST":
+                if obj_path in self.storage_objects and request.headers.get("x-upsert") != "true":
+                    return httpx.Response(409, json={"message": "The resource already exists"})
+                self.storage_objects[obj_path] = {
+                    "bytes": request.content,
+                    "content_type": request.headers.get("content-type"),
+                }
+                return httpx.Response(200, json={"Key": f"retrieva-user-documents/{obj_path}"})
+            if request.method == "DELETE":
+                if obj_path not in self.storage_objects:
+                    return httpx.Response(404, json={"message": "Object not found"})
+                del self.storage_objects[obj_path]
+                return httpx.Response(200, json={"message": "Successfully deleted"})
+
+        # PostgREST RPCs
+        body = json.loads(request.content.decode("utf-8")) if request.content else {}
+        if path == "/rest/v1/rpc/create_user_document" and request.method == "POST":
+            doc_id = body.get("p_document_id") or str(uuid4())
+            row = {
+                "id": doc_id,
+                "owner_id": str(TEST_OWNER_ID),
+                "storage_path": body["p_storage_path"],
+                "filename": body["p_filename"],
+                "file_extension": body["p_file_extension"],
+                "mime_type": body["p_mime_type"],
+                "content_hash": body["p_content_hash"],
+                "file_size_bytes": body["p_file_size_bytes"],
+                "processing_status": body.get("p_processing_status", "pending"),
+                "embedding_model": body.get("p_embedding_model"),
+                "total_pages": 0,
+                "total_chunks": 0,
+                "error_message": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+            self.documents[doc_id] = row
+            return httpx.Response(200, json=row)
+
+        if path == "/rest/v1/rpc/update_user_document_status" and request.method == "POST":
+            doc_id = body["p_document_id"]
+            row = self.documents.get(doc_id)
+            if not row:
+                return httpx.Response(200, json=[])
+            row["processing_status"] = body["p_processing_status"]
+            if body.get("p_total_pages") is not None:
+                row["total_pages"] = body["p_total_pages"]
+            if body.get("p_total_chunks") is not None:
+                row["total_chunks"] = body["p_total_chunks"]
+            if body.get("p_embedding_model") is not None:
+                row["embedding_model"] = body["p_embedding_model"]
+            row["updated_at"] = now
+            return httpx.Response(200, json=[row])
+
+        if path == "/rest/v1/rpc/delete_user_document" and request.method == "POST":
+            doc_id = body["p_document_id"]
+            row = self.documents.pop(doc_id, None)
+            return httpx.Response(200, json=[row] if row else [])
+
+        if path == "/rest/v1/documents" and request.method == "GET":
+            rows = [r for r in self.documents.values() if r["owner_id"] == str(TEST_OWNER_ID)]
+            if "id" in qs:
+                tid = qs["id"][0].removeprefix("eq.")
+                rows = [r for r in rows if r["id"] == tid]
+            if "content_hash" in qs:
+                thash = qs["content_hash"][0].removeprefix("eq.")
+                rows = [r for r in rows if r["content_hash"] == thash]
+            return httpx.Response(200, json=rows)
+
+        return httpx.Response(404, json={"message": "Not found"})
 
 
 def create_sample_pdf(text: str = "Retrieva AI provides grounded document retrieval.") -> bytes:
@@ -37,6 +143,37 @@ def create_sample_pdf(text: str = "Retrieva AI provides grounded document retrie
 
 class TestDocumentAPIEndpoints:
     """Test suite for /api/v1/documents endpoints."""
+
+    @pytest.fixture(autouse=True)
+    def mock_supabase_backend(self):
+        """Provide isolated mocked Supabase DocumentRepository & StorageRepository for API tests."""
+        self.mock_supabase = InMemorySupabaseMock()
+        self.mock_http = httpx.AsyncClient(transport=httpx.MockTransport(self.mock_supabase.handle))
+        sb_client = SupabaseClient(
+            supabase_url=TEST_SUPABASE_URL,
+            anon_key="test-anon-key",
+            access_token="test-jwt-token",
+            owner_id=TEST_OWNER_ID,
+            http_client=self.mock_http,
+        )
+        self.doc_repo = DocumentRepository(sb_client)
+        self.storage_repo = SupabaseStorageRepository(sb_client)
+
+        prev_doc_repo = app.dependency_overrides.get(get_document_repository)
+        prev_storage_repo = app.dependency_overrides.get(get_storage_repository)
+        app.dependency_overrides[get_document_repository] = lambda: self.doc_repo
+        app.dependency_overrides[get_storage_repository] = lambda: self.storage_repo
+        try:
+            yield
+        finally:
+            if prev_doc_repo is None:
+                app.dependency_overrides.pop(get_document_repository, None)
+            else:
+                app.dependency_overrides[get_document_repository] = prev_doc_repo
+            if prev_storage_repo is None:
+                app.dependency_overrides.pop(get_storage_repository, None)
+            else:
+                app.dependency_overrides[get_storage_repository] = prev_storage_repo
 
     def setup_method(self):
         """Clean up before each test."""
@@ -59,11 +196,11 @@ class TestDocumentAPIEndpoints:
         assert data["total_pages"] == 1
         assert data["total_chunks"] >= 1
         assert data["file_size_bytes"] == len(content)
-        assert data["document_id"].startswith("doc_")
+        UUID(data["document_id"])  # Valid UUID primary key from Supabase
 
         # Cleanup
-        self.ingestion_service.delete_document(data["document_id"])
-        self.retriever.sync_bm25_with_vector_store()
+        self.ingestion_service.delete_document(data["document_id"], owner_id=TEST_OWNER_ID)
+        self.retriever.remove_owner_document(TEST_OWNER_ID, data["document_id"])
 
     def test_upload_valid_pdf_success(self, sync_client: TestClient):
         """Verify successful upload and indexing for a standard PDF file."""
@@ -79,11 +216,11 @@ class TestDocumentAPIEndpoints:
         assert data["is_duplicate"] is False
         assert data["total_pages"] == 1
         assert data["total_chunks"] >= 1
-        assert data["document_id"].startswith("doc_")
+        UUID(data["document_id"])
 
         # Cleanup
-        self.ingestion_service.delete_document(data["document_id"])
-        self.retriever.sync_bm25_with_vector_store()
+        self.ingestion_service.delete_document(data["document_id"], owner_id=TEST_OWNER_ID)
+        self.retriever.remove_owner_document(TEST_OWNER_ID, data["document_id"])
 
     def test_upload_unsupported_extension_rejected(self, sync_client: TestClient):
         """Verify that files with unsupported extensions (.docx, .png, etc.) return 400 Bad Request."""
@@ -143,15 +280,11 @@ class TestDocumentAPIEndpoints:
         assert "already" in data2["message"].lower()
 
         # Cleanup
-        self.ingestion_service.delete_document(data1["document_id"])
-        self.retriever.sync_bm25_with_vector_store()
+        self.ingestion_service.delete_document(data1["document_id"], owner_id=TEST_OWNER_ID)
+        self.retriever.remove_owner_document(TEST_OWNER_ID, data1["document_id"])
 
     def test_list_documents(self, sync_client: TestClient):
         """Verify GET /api/v1/documents returns accurate catalog of stored documents."""
-        # Clean any preexisting state
-        for d in self.ingestion_service.registry.get_all():
-            self.ingestion_service.delete_document(d.document_id)
-
         # Ingest two distinct documents
         content1 = b"First unique document on thermodynamics and entropy."
         content2 = b"Second unique document on algorithmic complexity and graph algorithms."
@@ -186,8 +319,8 @@ class TestDocumentAPIEndpoints:
 
         # Cleanup
         for d in data["documents"]:
-            self.ingestion_service.delete_document(d["document_id"])
-        self.retriever.sync_bm25_with_vector_store()
+            self.ingestion_service.delete_document(d["document_id"], owner_id=TEST_OWNER_ID)
+            self.retriever.remove_owner_document(TEST_OWNER_ID, d["document_id"])
 
     def test_delete_document_success(self, sync_client: TestClient):
         """Verify DELETE /api/v1/documents/{id} removes document and returns deleted chunk count."""
@@ -233,14 +366,14 @@ class TestDocumentAPIEndpoints:
             query=f"Tell me about the {unique_term}",
             config=RetrievalConfiguration(mode=RetrievalMode.DENSE, top_k=5),
         )
-        res_dense = self.retriever.retrieve(req_dense)
+        res_dense = self.retriever.retrieve(req_dense, owner_id=TEST_OWNER_ID)
         assert any(unique_term in c.chunk_text for c in res_dense.chunks)
 
         req_bm25 = RetrievalRequest(
             query=unique_term,
             config=RetrievalConfiguration(mode=RetrievalMode.BM25, top_k=5),
         )
-        res_bm25 = self.retriever.retrieve(req_bm25)
+        res_bm25 = self.retriever.retrieve(req_bm25, owner_id=TEST_OWNER_ID)
         assert any(unique_term in c.chunk_text for c in res_bm25.chunks)
 
         # Delete document via API
@@ -248,10 +381,10 @@ class TestDocumentAPIEndpoints:
         assert del_res.status_code == 200
 
         # Verify retrieval yields 0 chunks for that unique term across both modes
-        res_dense_after = self.retriever.retrieve(req_dense)
+        res_dense_after = self.retriever.retrieve(req_dense, owner_id=TEST_OWNER_ID)
         assert not any(unique_term in c.chunk_text for c in res_dense_after.chunks)
 
-        res_bm25_after = self.retriever.retrieve(req_bm25)
+        res_bm25_after = self.retriever.retrieve(req_bm25, owner_id=TEST_OWNER_ID)
         assert not any(unique_term in c.chunk_text for c in res_bm25_after.chunks)
 
     def test_upload_disallowed_mime_type_rejected_415(self, sync_client: TestClient):
@@ -278,8 +411,8 @@ class TestDocumentAPIEndpoints:
         assert "\\" not in data["filename"]
 
         # Cleanup
-        self.ingestion_service.delete_document(data["document_id"])
-        self.retriever.sync_bm25_with_vector_store()
+        self.ingestion_service.delete_document(data["document_id"], owner_id=TEST_OWNER_ID)
+        self.retriever.remove_owner_document(TEST_OWNER_ID, data["document_id"])
 
     def test_upload_path_traversal_pure_dots_rejected(self, sync_client: TestClient):
         """Verify that filenames consisting only of path traversal dots (e.g. '..') are rejected."""
@@ -321,8 +454,8 @@ class TestDocumentAPIEndpoints:
         res = sync_client.post(f"{self.settings.API_V1_STR}/documents/upload", files=files)
         assert res.status_code == 200
         doc_id = res.json()["document_id"]
-        self.ingestion_service.delete_document(doc_id)
-        self.retriever.sync_bm25_with_vector_store()
+        self.ingestion_service.delete_document(doc_id, owner_id=TEST_OWNER_ID)
+        self.retriever.remove_owner_document(TEST_OWNER_ID, doc_id)
 
     def test_upload_multilingual_utf8_txt_success(self, sync_client: TestClient):
         """Verify upload of multilingual UTF-8 text file succeeds."""
@@ -333,8 +466,8 @@ class TestDocumentAPIEndpoints:
         res = sync_client.post(f"{self.settings.API_V1_STR}/documents/upload", files=files)
         assert res.status_code == 200
         doc_id = res.json()["document_id"]
-        self.ingestion_service.delete_document(doc_id)
-        self.retriever.sync_bm25_with_vector_store()
+        self.ingestion_service.delete_document(doc_id, owner_id=TEST_OWNER_ID)
+        self.retriever.remove_owner_document(TEST_OWNER_ID, doc_id)
 
     def test_upload_utf8_bom_txt_success(self, sync_client: TestClient):
         """Verify upload of UTF-8 file with Byte Order Mark (BOM) succeeds."""
@@ -343,8 +476,8 @@ class TestDocumentAPIEndpoints:
         res = sync_client.post(f"{self.settings.API_V1_STR}/documents/upload", files=files)
         assert res.status_code == 200
         doc_id = res.json()["document_id"]
-        self.ingestion_service.delete_document(doc_id)
-        self.retriever.sync_bm25_with_vector_store()
+        self.ingestion_service.delete_document(doc_id, owner_id=TEST_OWNER_ID)
+        self.retriever.remove_owner_document(TEST_OWNER_ID, doc_id)
 
     def test_upload_invalid_utf8_binary_payload_rejected_400(self, sync_client: TestClient):
         """Verify that invalid UTF-8 byte sequences are rejected with 400 Bad Request."""
@@ -394,21 +527,24 @@ class TestDocumentAPIEndpoints:
         assert "unsupported media type" in res.json()["detail"].lower()
 
     def test_delete_recovery_chromadb_succeeds_metadata_fails(self, sync_client: TestClient):
-        """Verify multi-store failure recovery when ChromaDB deletion succeeds but metadata persistence fails."""
+        """Verify multi-store failure recovery when ChromaDB/Storage delete succeeds but metadata deletion fails."""
         content = b"Sample text for delete recovery failure test."
         files = {"file": ("delete_recovery_test.txt", io.BytesIO(content), "text/plain")}
         res = sync_client.post(f"{self.settings.API_V1_STR}/documents/upload", files=files)
         assert res.status_code == 200
         doc_id = res.json()["document_id"]
 
-        with patch.object(self.ingestion_service.registry, "remove", side_effect=Exception("Disk persistence failure")):
+        with patch.object(self.doc_repo, "delete_document", side_effect=RuntimeError("Metadata DB delete failure")):
             del_res = sync_client.delete(f"{self.settings.API_V1_STR}/documents/{doc_id}")
             assert del_res.status_code == 500
-            assert "metadata registry persistence failed" in del_res.json()["detail"].lower()
+            assert "failed to delete document" in del_res.json()["detail"].lower()
 
-        # Clean up
-        self.ingestion_service.delete_document(doc_id)
-        self.retriever.sync_bm25_with_vector_store()
+        # Metadata row stays in 'deleting' state so retry succeeds idempotently
+        assert self.mock_supabase.documents[doc_id]["processing_status"] == "deleting"
+        retry_res = sync_client.delete(f"{self.settings.API_V1_STR}/documents/{doc_id}")
+        assert retry_res.status_code == 200
+        assert doc_id not in self.mock_supabase.documents
+        self.retriever.remove_owner_document(TEST_OWNER_ID, doc_id)
 
     def test_delete_recovery_metadata_succeeds_bm25_fails(self, sync_client: TestClient):
         """Verify multi-store failure behavior when metadata deletion succeeds but BM25 rebuilding fails."""
@@ -418,17 +554,19 @@ class TestDocumentAPIEndpoints:
         assert res.status_code == 200
         doc_id = res.json()["document_id"]
 
-        with patch.object(self.retriever, "sync_bm25_with_vector_store", side_effect=RuntimeError("Simulated BM25 crash")):
+        with patch.object(self.retriever, "remove_owner_document", side_effect=RuntimeError("Simulated BM25 crash")):
             del_res = sync_client.delete(f"{self.settings.API_V1_STR}/documents/{doc_id}")
             assert del_res.status_code == 500
             assert "bm25 keyword index synchronization failed" in del_res.json()["detail"].lower()
 
         # Re-sync to restore state
-        self.retriever.sync_bm25_with_vector_store()
+        self.retriever.remove_owner_document(TEST_OWNER_ID, doc_id)
 
     def test_restart_after_partial_deletion_reconciliation(self):
         """Verify that reconciliation during restart prunes orphaned metadata records left by partial deletions."""
+        from backend.app.document_processing.identifier import DocumentRegistry
         from backend.app.schemas.document import DocumentMetadata
+        registry = DocumentRegistry(persist_path=None)
         orphan_id = "doc_partial_orphan_999"
         orphan_meta = DocumentMetadata(
             document_id=orphan_id,
@@ -439,20 +577,21 @@ class TestDocumentAPIEndpoints:
             total_pages=1,
             total_chunks=1,
         )
-        self.ingestion_service.registry.register(orphan_meta)
-        assert self.ingestion_service.registry.get_by_id(orphan_id) is not None
+        registry.register(orphan_meta)
+        assert registry.get_by_id(orphan_id) is not None
 
-        # Reconcile against vector store (which has 0 chunks for this orphan)
-        pruned = self.ingestion_service.registry.reconcile_from_vector_store(
+        pruned = registry.reconcile_from_vector_store(
             self.ingestion_service.vector_store, prune_orphans=True
         )
         assert pruned >= 1
-        assert self.ingestion_service.registry.get_by_id(orphan_id) is None
+        assert registry.get_by_id(orphan_id) is None
 
     def test_reconciliation_discovers_uncataloged_chromadb_document(self):
         """Verify that reconciliation discovers chunks in ChromaDB missing from DocumentRegistry."""
         import numpy as np
+        from backend.app.document_processing.identifier import DocumentRegistry
         from backend.app.schemas.document import DocumentChunk
+        registry = DocumentRegistry(persist_path=None)
         doc_id = "doc_uncataloged_direct"
         norm_vec = np.zeros(384, dtype=np.float32)
         norm_vec[0] = 1.0
@@ -473,25 +612,21 @@ class TestDocumentAPIEndpoints:
         self.ingestion_service.vector_store.add_chunks(
             chunks=[chunk],
             embeddings=[norm_vec.tolist()],
+            owner_id=TEST_OWNER_ID,
         )
 
-        # Confirm registry does not have it yet
-        if self.ingestion_service.registry.get_by_id(doc_id):
-            self.ingestion_service.registry.remove(doc_id)
-
         # Run reconciliation
-        reconciled = self.ingestion_service.registry.reconcile_from_vector_store(
+        reconciled = registry.reconcile_from_vector_store(
             self.ingestion_service.vector_store, prune_orphans=False
         )
         assert reconciled >= 1
-        meta = self.ingestion_service.registry.get_by_id(doc_id)
+        meta = registry.get_by_id(doc_id)
         assert meta is not None
         assert meta.filename == "uncataloged.txt"
         assert meta.total_chunks == 1
 
         # Clean up
-        self.ingestion_service.vector_store.delete_document(doc_id)
-        self.ingestion_service.registry.remove(doc_id)
+        self.ingestion_service.vector_store.delete_document(doc_id, owner_id=TEST_OWNER_ID)
 
     def test_repeated_deletion_idempotency_does_not_corrupt_stores(self, sync_client: TestClient):
         """Verify repeated deletion is idempotent and does not corrupt persistent stores or indexes."""
@@ -509,8 +644,3 @@ class TestDocumentAPIEndpoints:
         # Second deletion -> 404 Not Found
         del2 = sync_client.delete(f"{self.settings.API_V1_STR}/documents/{doc_id}")
         assert del2.status_code == 404
-
-        # Sequential reconciliation runs are idempotent
-        r1 = self.ingestion_service.registry.reconcile_from_vector_store(self.ingestion_service.vector_store)
-        r2 = self.ingestion_service.registry.reconcile_from_vector_store(self.ingestion_service.vector_store)
-        assert r2 == 0
